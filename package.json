@@ -1,0 +1,9 @@
+{
+  "name": "emu-core-bench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Benchmarks comparing interpreter-core designs for CPU emulators (dispatch architecture, predecode) on native and WebAssembly targets",
+  "devDependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

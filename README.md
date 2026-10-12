@@ -43,7 +43,7 @@ A seventh PPC backend (G, `ppc/ppc_jit.c`) then tests the step past
 interpretation: a **WebAssembly JIT** that translates each guest code page
 into one wasm function at run time (generated from C, instantiated
 synchronously against the module's own memory and table, called through a
-C function pointer).  On V8 it runs **2.7–8× faster than the best
+C function pointer).  On V8 it runs **3–7.6× faster than the best
 interpreter** (pdx-8B), verified bit-identical, and stays exact with
 device accesses mid-block, self-modifying code and translations installed
 at arbitrary times (§2.5, §2.6, §4.6).  V8 compiles each function lazily
@@ -383,14 +383,13 @@ deopt, `jit-call` by spill + call (§2.6):
 
 | kernel | switch | pdx-8B | wasm-jit | jit-call | wasm-jit vs pdx-8B |
 |---|---|---|---|---|---|
-| alu-loop | 200 (197) | 347 (383) | **1331 (1256)** | 1311 (1255) | 3.3–3.8× |
-| mem-stream | 229 (244) | 489 (536) | **1631 (1468)** | 1173 (1464) | 2.7–3.3× |
-| dispatch-stress | 56 (60) | 114 (97) | **794 (781)** | 306 (375) | 6.9–8.0× |
-| io-mixed | 71 (…) | 100 (…) | 497 (…) | **541 (…)** | ~5× |
-| smc-burst | 291 (…) | n/a | **569 (…)** | 520 (…) | 2.0× switch |
+| alu-loop | 200 (199) | 347 (349) | **1331 (1264)** | 1311 (1267) | 3.6–3.8× |
+| mem-stream | 229 (213) | 489 (542) | **1631 (1661)** | 1173 (1348) | 3.1–3.3× |
+| dispatch-stress | 56 (56) | 114 (105) | **794 (792)** | 306 (397) | 7.0–7.6× |
+| io-mixed | 71 (75) | 100 (97) | 497 (512) | 541 (509) | 5.0–5.3× |
+| smc-burst | 291 (241) | n/a | 569 (578) | 520 (612) | 2.0–2.4× switch |
 
-MIPS, Node first, Chromium in parentheses.  (…): the Chromium run of
-the two Phase A kernels is pending.  Every backend verifies
+MIPS, Node first, Chromium in parentheses.  Every backend verifies
 identical on every kernel it runs (registers, pc, CR, CTR, LR, XER.CA,
 all 8 MB of RAM and the device-access hash), and both JIT backends
 verify identical under four chaos seeds.  Over the whole Node run the
@@ -403,7 +402,8 @@ instantiation in all, and took 12.2 M deopt exits.
 Per page, averaged over the run (Node; `ppc_jit_split`): translate
 (C, guest code to wasm bytes) **0.040 ms**, `new WebAssembly.Module`
 0.048 ms, `new WebAssembly.Instance` 0.126 ms, first call 0.106 ms,
-second call 0.0003 ms.  The first call is where V8 actually compiles:
+second call 0.0003 ms (Chromium: 0.041, 0.202, 0.019, 0.417, 0.0005 ms).
+The first call is where V8 actually compiles:
 it compiles wasm **lazily**, function by function at first call, so
 `WebAssembly.compile` off the main thread does not by itself keep
 compilation off the calling thread.  `tools/jit-lab` measures this on
@@ -496,14 +496,14 @@ allocates to host registers, and turns in-page control flow into wasm
 branches; the remaining per-instruction cost is the work itself (an add
 is an add; a load is the inlined SoA lookup plus the byte swap).  The
 gain is largest where the interpreter's dispatch was least predictable
-(dispatch-stress, 7–8×) and smallest on the memory kernel, where the
+(dispatch-stress, 7–7.6×) and smallest on the memory kernel, where the
 inlined fast path dominates both.  Its costs are the ones §1 names:
 translation and compilation time (~0.3 ms per page on the core thread
 here, ~0.1 ms when a worker compiles and warms it, §4.7; paid once per
 page version) and, for a real system, everything this subset leaves out
 (§6).  Exits are cheap enough that a 2% rate of device accesses, each a
 deopt to the interpreter for one instruction, still leaves 5× (io-mixed),
-and a page rewritten every 63 instructions still runs at 2× the switch
+and a page rewritten every 63 instructions still runs at 2–2.4× the switch
 interpreter once retranslation is throttled by cooling (smc-burst).
 
 ## 6. Threats to validity
@@ -540,7 +540,7 @@ interpreter once retranslation is throttled by cooling (smc-burst).
   compile runs on the core thread (the async pipeline is modelled by the
   chaos delay; its core-thread cost is measured separately in §4.7).  A
   production JIT also translates through an MMU whose tables change, and
-  the DR 68K emulator writes PowerPC code continuously.  The 3–8× is an
+  the DR 68K emulator writes PowerPC code continuously.  The 3–7.6× is an
   upper-end figure for the code that remains, not a whole-system
   forecast.
 - **jit-call's spill is naive.**  It stores all 36 guest registers at

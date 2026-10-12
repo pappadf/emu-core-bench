@@ -35,15 +35,20 @@ for (const name of process.argv.slice(2).length ? process.argv.slice(2) : ["chro
     const lines = [];
     let done;
     const finished = new Promise((r) => (done = r));
+    page.on("crash", () => {
+        lines.push("FATAL: page crashed");
+        done();
+    });
     page.on("console", (msg) => {
         const t = msg.text();
-        if (/^(ppc dispatch|m68k format|alu-loop|mem-stream|dispatch-stress|benchmark done|FAIL|FATAL)/.test(t)) {
+        if (process.env.BENCH_STREAM) console.error(t);
+        if (/^(ppc dispatch|m68k format|alu-loop|mem-stream|dispatch-stress|io-mixed|smc-burst|wasm-jit|benchmark done|FAIL|FATAL)/.test(t)) {
             if (!t.startsWith("benchmark done")) lines.push(t);
             if (t.startsWith("benchmark done") || t.startsWith("FAIL") || t.startsWith("FATAL")) done();
         }
     });
     await page.goto(`http://127.0.0.1:${port}/${process.env.BENCH_PAGE ?? "bench_web.html"}`);
-    await Promise.race([finished, new Promise((r) => setTimeout(r, 300000))]);
+    await Promise.race([finished, new Promise((r) => setTimeout(r, Number(process.env.BENCH_TIMEOUT_MS ?? 300000)))]);
     console.log(`=== ${name} (${browser.version()}) ===`);
     for (const l of lines) console.log(l);
     await browser.close();

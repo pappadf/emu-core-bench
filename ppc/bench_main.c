@@ -65,6 +65,8 @@ void ppc_illegal(ppc_t *c, uint32_t insn) {
 #define E_BC(bo, bi, off) (((uint32_t)16 << 26) | ((uint32_t)(bo) << 21) | ((uint32_t)(bi) << 16) | ((uint32_t)(off) & 0xFFFCu))
 #define E_BDNZ(off)       E_BC(16, 0, off)
 #define E_B(off)          (((uint32_t)18 << 26) | ((uint32_t)(off) & 0x03FFFFFCu))
+#define E_BL(off)         (E_B(off) | 1u)
+#define E_BLR             0x4E800020u
 
 static uint32_t g_emit_pc; // guest address the next emit() lands at
 
@@ -83,6 +85,9 @@ static uint32_t lcg(uint32_t *s) {
 #define CODE_BASE  0x001000u // all kernels are emitted here
 #define DATA_BASE  0x100000u // read window (64 KB of PRNG fill)
 #define STORE_BASE 0x180000u // write window
+#define DEVICE_BASE 0x200000u // device window (io-mixed): every access takes the slow path
+#define DEVICE_BYTES 0x4000u
+#define GEN_BASE 0x010000u // smc-burst: the page of "generated" code
 
 // Kernel 1: tight predictable ALU loop (10 instructions/iteration).
 // Small code footprint, dispatch trivially predictable — the switch
@@ -198,6 +203,113 @@ static void emit_kernel_stress(void) {
     emit(E_B((int32_t)(loop - g_emit_pc)));
 }
 
+#define IO_STREAM_LEN 4096 // instructions in the io-mixed stream
+
+// Kernel 4: io-mixed — dispatch-stress's random stream (4096 instructions,
+// looped) where about 2 % of the instructions access the device window
+// (lwz/stw/lbz/stb through r22).  Every such access takes the memory slow
+// path; the device folds a hash of the complete CPU state into its own, so
+// the kernel verifies that every backend's state is exact at each one —
+// the JIT's in particular, which must leave its translation (or write its
+// registers back) to perform them.
+static void emit_kernel_io(void) {
+    uint32_t seed = 0xB0BACAFEu;
+    for (int r = 3; r <= 12; r++) {
+        uint32_t v = lcg(&seed);
+        emit(E_ADDIS(r, 0, (int32_t)(v >> 16)));
+        emit(E_ORI(r, r, v & 0xFFFF));
+    }
+    emit(E_ADDIS(20, 0, DATA_BASE >> 16));
+    emit(E_ADDIS(21, 0, STORE_BASE >> 16));
+    emit(E_ADDIS(22, 0, DEVICE_BASE >> 16));
+    uint32_t loop = g_emit_pc;
+    for (int i = 0; i < IO_STREAM_LEN; i++) {
+        uint32_t r = lcg(&seed);
+        int rd = 3 + (int)((r >> 8) % 10);
+        int ra = 3 + (int)((r >> 12) % 10);
+        int rb = 3 + (int)((r >> 16) % 10);
+        uint32_t off = (r >> 20) & 0x7FC;
+        int pick = (int)(r % 1000);
+        bool last = (i == IO_STREAM_LEN - 1);
+        if (pick < 5)
+            emit(E_LWZ(rd, 22, off)); // device
+        else if (pick < 10)
+            emit(E_STW(rd, 22, off)); // device
+        else if (pick < 15)
+            emit(E_LBZ(rd, 22, off + 1)); // device
+        else if (pick < 20)
+            emit(E_STB(rd, 22, off + 2)); // device
+        else if (pick < 150)
+            emit(E_ADD(rd, ra, rb));
+        else if (pick < 250)
+            emit(E_SUBF(rd, ra, rb));
+        else if (pick < 330)
+            emit(E_XOR(rd, ra, rb));
+        else if (pick < 400)
+            emit(E_RLWINM(rd, ra, (r >> 3) & 31, (r >> 26) & 31, 31));
+        else if (pick < 500)
+            emit(E_ADDI(rd, ra, (int32_t)(r & 0xFF) - 128));
+        else if (pick < 560)
+            emit(E_MULLW(rd, ra, rb));
+        else if (pick < 620)
+            emit(E_SRAWI(rd, ra, (r >> 3) & 31));
+        else if (pick < 720)
+            emit(E_LWZ(rd, 20, off));
+        else if (pick < 780)
+            emit(E_LBZ(rd, 20, off));
+        else if (pick < 860)
+            emit(E_STW(rd, 21, off));
+        else if (pick < 900)
+            emit(E_STB(rd, 21, off));
+        else if (pick < 950)
+            emit(E_CMPWI(7, ra, (int32_t)(r & 0x7FFF) - 16384));
+        else if (!last)
+            emit(E_BC(((r >> 5) & 1) ? 12 : 4, 28 + (int)((r >> 6) & 3), 8));
+        else
+            emit(E_ADD(rd, ra, rb));
+    }
+    emit(E_B((int32_t)(loop - g_emit_pc)));
+}
+
+#define SMC_CALLS 4096 // routine calls between rewrites
+
+// Kernel 5: smc-burst — self-modifying code the way a dynamic translator
+// (Apple's DR 68K emulator) produces it: a 64-instruction routine in a page
+// of its own is rewritten in a burst (16 of its addi immediates, loaded,
+// changed and stored back) and then called SMC_CALLS times, about 270 K
+// instructions per rewrite.  Only the backends that fetch through memory
+// (and the JIT, through its code-page marks) are coherent with it.
+static void emit_kernel_smc(void) {
+    // The routine, assembled in place
+    uint32_t save = g_emit_pc;
+    g_emit_pc = GEN_BASE;
+    for (int i = 0; i < 63; i++) {
+        switch (i % 4) {
+        case 0: emit(E_ADDI(5, 5, 3 + i)); break;
+        case 1: emit(E_RLWINM(6, 5, (i % 31) + 1, 0, 31)); break;
+        case 2: emit(E_ADD(9, 9, 6)); break;
+        default: emit(E_XOR(5, 5, 9)); break;
+        }
+    }
+    emit(E_BLR);
+    g_emit_pc = save;
+    // The driver
+    emit(E_ADDIS(22, 0, GEN_BASE >> 16));
+    emit(E_ORI(22, 22, GEN_BASE & 0xFFFF));
+    uint32_t outer = g_emit_pc;
+    for (int j = 0; j < 16; j++) { // the burst: rewrite every addi
+        emit(E_LWZ(8, 22, 16 * j));
+        emit(E_XORI(8, 8, 1 + (j & 7)));
+        emit(E_STW(8, 22, 16 * j));
+    }
+    emit(E_ADDI(10, 0, SMC_CALLS));
+    emit(E_MTCTR(10));
+    uint32_t inner = g_emit_pc;
+    emit(E_BL((int32_t)(GEN_BASE - g_emit_pc)));
+    emit(E_BDNZ((int32_t)(inner - g_emit_pc)));
+    emit(E_B((int32_t)(outer - g_emit_pc)));
+}
+
 // Reset guest RAM + CPU state and assemble kernel `k`; both backends must
 // start every run from this exact state
 static void setup_kernel(int k, ppc_t *c) {
@@ -212,8 +324,13 @@ static void setup_kernel(int k, ppc_t *c) {
         emit_kernel_alu();
     else if (k == 1)
         emit_kernel_mem();
-    else
+    else if (k == 2)
         emit_kernel_stress();
+    else if (k == 3)
+        emit_kernel_io();
+    else
+        emit_kernel_smc();
+    mem_env_device_reset();
     memset(c, 0, sizeof(*c));
     c->pc = CODE_BASE;
 }
@@ -235,6 +352,7 @@ static uint64_t state_hash(const ppc_t *c) {
         memcpy(&w, g_ram + i, 8);
         MIX(w);
     }
+    MIX(mem_env_device_state());
 #undef MIX
     return h;
 }
@@ -252,23 +370,50 @@ static double now_ms(void) {
 
 typedef void run_fn(ppc_t *c, uint32_t budget);
 #ifdef __EMSCRIPTEN__
-#define NBACKENDS 7 // + G: the wasm JIT (runtime code generation needs a wasm host)
+#define NBACKENDS 8 // + G, G': the wasm JIT (runtime code generation needs a wasm host)
 #else
 #define NBACKENDS 6
 #endif
 static run_fn *const g_backends[NBACKENDS] = { ppc_run_switch, ppc_run_tail, ppc_run_call,
                                                ppc_run_pd, ppc_run_pdx8, ppc_run_pdx16
 #ifdef __EMSCRIPTEN__
-                                               , ppc_run_jit
+                                               , ppc_run_jit, ppc_run_jit_call
 #endif
 };
 static const char *const g_backend_names[NBACKENDS] = { "switch", "tail-call", "call-loop",
                                                         "pd-raw", "pdx-8B", "pdx-16B"
 #ifdef __EMSCRIPTEN__
-                                                        , "wasm-jit"
+                                                        , "wasm-jit", "jit-call"
 #endif
 };
-static const char *const g_kernel_names[3] = { "alu-loop", "mem-stream", "dispatch-stress" };
+#define NKERNELS 5
+static const char *const g_kernel_names[NKERNELS] = { "alu-loop", "mem-stream", "dispatch-stress", "io-mixed",
+                                                      "smc-burst" };
+#define K_SMC 4
+
+// Backends that see code writes: the ones that fetch through memory, and
+// the JIT (code-page marks).  The predecode backends decode their region
+// once per run and are not run on smc-burst.
+static bool runs_on(int b, int k) {
+    if (k != K_SMC)
+        return true;
+    return b <= 2 || b >= 6; // switch, tail-call, call-loop, wasm-jit, jit-call
+}
+
+// The device's view of the CPU (mem_env.h): every register a backend must
+// have committed at a slow-path access.  The pc is not included: the
+// predecoded backends materialize it only at sprint exit.
+static ppc_t *g_cur_cpu;
+static uint64_t cpu_snapshot(void) {
+    uint64_t h = 0x84222325cbf29ce4ull;
+    for (int i = 0; i < 32; i++)
+        h = (h ^ g_cur_cpu->gpr[i]) * 0x100000001b3ull;
+    h = (h ^ g_cur_cpu->cr) * 0x100000001b3ull;
+    h = (h ^ g_cur_cpu->ctr) * 0x100000001b3ull;
+    h = (h ^ g_cur_cpu->lr) * 0x100000001b3ull;
+    h = (h ^ g_cur_cpu->xer_ca) * 0x100000001b3ull;
+    return h;
+}
 
 #ifndef BENCH_DEFAULT_BUDGET
 #define BENCH_DEFAULT_BUDGET (100u * 1000 * 1000)
@@ -287,7 +432,9 @@ int main(int argc, char **argv) {
         reps = atoi(argv[2]);
 
     mem_env_init(RAM_SIZE);
+    mem_env_device(DEVICE_BASE, DEVICE_BYTES);
     g_ram = mem_env_ram();
+    g_dev_cpu_snapshot = cpu_snapshot;
 
     printf("ppc dispatch benchmark: budget=%u reps=%d musttail=%s\n", bench_budget, reps,
 #if defined(__clang__) && __has_attribute(musttail)
@@ -298,23 +445,47 @@ int main(int argc, char **argv) {
     );
 
     ppc_t cpu;
-    for (int k = 0; k < 3; k++) {
+    g_cur_cpu = &cpu;
+    for (int k = 0; k < NKERNELS; k++) {
         // 1. correctness: both backends must produce bit-identical state
         uint64_t hash[NBACKENDS];
         for (int b = 0; b < NBACKENDS; b++) {
+            if (!runs_on(b, k))
+                continue;
             setup_kernel(k, &cpu);
             g_backends[b](&cpu, verify_budget);
             hash[b] = state_hash(&cpu);
         }
         for (int b = 1; b < NBACKENDS; b++) {
-            if (hash[b] != hash[0]) {
+            if (runs_on(b, k) && hash[b] != hash[0]) {
                 fprintf(stderr, "FAIL %s: backend %s diverged (%016" PRIx64 " vs %016" PRIx64 ")\n",
                         g_kernel_names[k], g_backend_names[b], hash[0], hash[b]);
                 return 1;
             }
         }
+#ifdef __EMSCRIPTEN__
+        // 1b. chaos: translations "arrive" after random delays (an
+        // asynchronous pipeline's timing); the state must not move
+        for (uint32_t seed = 1; seed <= 4; seed++) {
+            for (int b = 6; b <= 7; b++) {
+                ppc_jit_reset();
+                g_jit_chaos_seed = seed * 2654435761u;
+                setup_kernel(k, &cpu);
+                g_backends[b](&cpu, verify_budget);
+                g_jit_chaos_seed = 0;
+                if (state_hash(&cpu) != hash[0]) {
+                    fprintf(stderr, "FAIL %s: %s diverged under chaos seed %u\n", g_kernel_names[k],
+                            g_backend_names[b], seed);
+                    return 1;
+                }
+            }
+        }
+        ppc_jit_reset();
+#endif
         // 2. warmup: let the engine's optimizing tier compile both backends
         for (int b = 0; b < NBACKENDS; b++) {
+            if (!runs_on(b, k))
+                continue;
             setup_kernel(k, &cpu);
             g_backends[b](&cpu, bench_budget / 2);
         }
@@ -324,6 +495,8 @@ int main(int argc, char **argv) {
             best[b] = 1e30;
         for (int r = 0; r < reps; r++) {
             for (int b = 0; b < NBACKENDS; b++) {
+                if (!runs_on(b, k))
+                    continue;
                 setup_kernel(k, &cpu);
                 double t0 = now_ms();
                 g_backends[b](&cpu, bench_budget);
@@ -336,9 +509,20 @@ int main(int argc, char **argv) {
         for (int b = 0; b < NBACKENDS; b++)
             mips[b] = (double)bench_budget / 1e3 / best[b];
         for (int b = 0; b < NBACKENDS; b++) {
+            if (!runs_on(b, k)) {
+                printf("%-16s %-10s      n/a  (decodes once per run: not coherent with code writes)\n",
+                       g_kernel_names[k], g_backend_names[b]);
+                continue;
+            }
             printf("%-16s %-10s %8.1f MIPS", g_kernel_names[k], g_backend_names[b], mips[b]);
             if (b == 0)
-                printf("  (baseline, verify=ok)\n");
+                printf("  (baseline, verify=ok%s)\n",
+#ifdef __EMSCRIPTEN__
+                       ", JIT chaos x4 ok"
+#else
+                       ""
+#endif
+                );
             else
                 printf("  (%+.1f%%)\n", (mips[b] / mips[0] - 1.0) * 100.0);
         }
@@ -346,6 +530,16 @@ int main(int argc, char **argv) {
 #ifdef __EMSCRIPTEN__
     printf("wasm-jit: %u page translations, %u bytes of wasm, %.1f ms translating + compiling in all\n",
            ppc_jit_compiles(), ppc_jit_compile_bytes(), ppc_jit_compile_ms());
+    {
+        double tr, mo, in, f1, f2;
+        ppc_jit_split(&tr, &mo, &in, &f1, &f2);
+        unsigned n = ppc_jit_compiles();
+        printf("wasm-jit: %u exits to the interpreter at a slow-path access; %u translations dropped by code writes\n",
+               ppc_jit_deopts(), ppc_jit_invalidations());
+        printf("wasm-jit split per page: translate %.3f ms, Module (sync compile) %.3f ms, Instance %.3f ms, "
+               "first call %.3f ms, second call %.4f ms\n",
+               tr / n, mo / n, in / n, f1 / n, f2 / n);
+    }
 #endif
     printf("benchmark done\n");
     return 0;

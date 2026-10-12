@@ -43,9 +43,12 @@ A seventh PPC backend (G, `ppc/ppc_jit.c`) then tests the step past
 interpretation: a **WebAssembly JIT** that translates each guest code page
 into one wasm function at run time (generated from C, instantiated
 synchronously against the module's own memory and table, called through a
-C function pointer).  On V8 it runs **2.8–5.5× faster than the best
-interpreter** (pdx-8B), verified bit-identical, for about 0.5 ms of
-translation and compilation per page (§2.5, §4.6).
+C function pointer).  On V8 it runs **2.7–8× faster than the best
+interpreter** (pdx-8B), verified bit-identical, and stays exact with
+device accesses mid-block, self-modifying code and translations installed
+at arbitrary times (§2.5, §2.6, §4.6).  V8 compiles each function lazily
+at its first call; compiling *and calling once* on a worker before posting
+the Module cuts the cost to the core thread to ~0.1 ms per page (§4.7).
 
 ## 1. Introduction
 
@@ -247,13 +250,57 @@ translated on first entry into one wasm function
   an instruction outside the subset leaves with the pc in the state; the C
   dispatcher looks the target page up and calls its function — one
   indirect call per page entry, not per instruction.
-- **Code coherence**: a translated page keeps a copy of its bytes and is
-  revalidated against guest RAM the first time each run enters it (the
-  stand-in for write invalidation; translations are reused across runs
-  when unchanged).  Compile time is charged to the run that compiles.
+- **Code coherence** (§2.6): a translated page is marked in the memory
+  layer, so a guest store into it calls a write hook that drops the
+  translation; on entry each run also revalidates it against a copy of
+  its bytes.  Compile time is charged to the run that compiles.
 
 Native builds have no runtime code generation, so G is in the wasm
 binaries only.
+
+### 2.6 Phase A: what a production JIT must survive
+
+Three kernels and two mechanisms test the cases §6 lists as missing
+from the friendly kernels.  They exist to answer one question each:
+does the design stay exact, and what does it cost?
+
+- **io-mixed (device accesses mid-block).**  A 4096-instruction stream
+  in which ~2% of the loads and stores (lwz/stw/lbz/stb through r22) hit
+  a device window at `0x200000`.  The window has no fast-path entry: its
+  slow-path handler updates device state and records a hash of the full
+  CPU state at the moment of the access (`g_dev_cpu_snapshot`), so the
+  verification fails unless every backend presents the same registers,
+  pc and remaining budget at every device access.  The JIT has two slow
+  paths for this:
+  - **deopt** (`wasm-jit`): the slow branch stores the live registers,
+    returns the unused part of the block's budget, sets the exit pc to
+    the faulting instruction and leaves; the C loop runs exactly one
+    instruction in the interpreter and re-enters the translation.
+  - **spill + call** (`jit-call`): the slow branch spills all 36 guest
+    registers and calls the C slow path in place, then continues; after
+    a store it compares a code epoch and leaves at the next instruction
+    if the store invalidated code.
+- **smc-burst (self-modifying code).**  A 63-instruction routine at
+  `0x010000` is called 4096 times; each call first rewrites 16 of its
+  words (lwz/xori/stw) so the next call runs different code.  Every
+  rewrite hits a marked code page, fires the write hook, and drops the
+  translation; the page then **cools** (64 entries interpreted) before it
+  is retranslated, which is the policy a real system needs for a page
+  that is both data and code.  Predecode backends D–F are not coherent
+  with code writes (they decode once per run) and report n/a.
+- **Install-timing independence (chaos).**  A production translator
+  runs off-thread, so a translation becomes available at an arbitrary
+  point.  With `g_jit_chaos_seed` set, each newly-needed page is
+  interpreted for a pseudo-random 1–64 entries before its translation is
+  installed.  The JIT backends run each kernel under four seeds and must
+  hash identical to the switch interpreter every time ("JIT chaos x4 ok"
+  in §4.6): the result never depends on when code was installed.
+- **Function-table slots are recycled.**  Each translation occupies one
+  slot of the module's function table; a dropped translation releases
+  its slot (`table.set(slot, null)`) onto a free list for the next
+  compile.  Without this the table grew on every SMC retranslation and
+  each instantiation slowed with it (smc-burst ran at 101 MIPS, below
+  the switch interpreter; with reuse, 568).
 
 ## 3. Experimental setup
 
@@ -329,20 +376,59 @@ always; the swap is a minor cost and unimprovable from C.
 
 ### 4.6 Backend G, the wasm JIT (100 M instructions, best of 5)
 
-Node 22 (V8; a second pass in parentheses) and Chromium 153 (playwright),
-2026-10-12, on the same class of shared cloud host as §3:
+Node 22 (V8) and Chromium 153 (playwright), 2026-10-12, on the same
+class of shared cloud host as §3 (`results-jit-node.log`,
+`results-jit-chromium.log`).  `wasm-jit` takes slow-path accesses by
+deopt, `jit-call` by spill + call (§2.6):
 
-| kernel | switch | pdx-8B | wasm-jit (Node) | wasm-jit (Chromium) | G vs pdx-8B |
+| kernel | switch | pdx-8B | wasm-jit | jit-call | wasm-jit vs pdx-8B |
 |---|---|---|---|---|---|
-| alu-loop | 208–228 MIPS | 371–377 | **1324 (1341)** | **1259** (pdx-8B 342) | 3.5–3.7× |
-| mem-stream | 225 MIPS | 487–515 | **1360 (1359)** | **1745** (pdx-8B 543) | 2.6–3.2× |
-| dispatch-stress | 54–60 MIPS | 106–112 | **456 (667)** | **516** (pdx-8B 93) | 4.1–6.3× |
+| alu-loop | 200 (197) | 347 (383) | **1331 (1256)** | 1311 (1255) | 3.3–3.8× |
+| mem-stream | 229 (244) | 489 (536) | **1631 (1468)** | 1173 (1464) | 2.7–3.3× |
+| dispatch-stress | 56 (60) | 114 (97) | **794 (781)** | 306 (375) | 6.9–8.0× |
+| io-mixed | 71 (…) | 100 (…) | 497 (…) | **541 (…)** | ~5× |
+| smc-burst | 291 (…) | n/a | **569 (…)** | 520 (…) | 2.0× switch |
 
-All seven backends verify identical on every kernel (registers, pc, CR,
-CTR, LR, XER.CA and all 8 MB of RAM).  The whole benchmark translates 20
-pages into 690 KB of wasm, in 10–13 ms of translation, synchronous
-compilation (V8's baseline tier) and instantiation together; the engine's
-optimizing tier then recompiles hot functions in the background.
+MIPS, Node first, Chromium in parentheses.  (…): the Chromium run of
+the two Phase A kernels is pending.  Every backend verifies
+identical on every kernel it runs (registers, pc, CR, CTR, LR, XER.CA,
+all 8 MB of RAM and the device-access hash), and both JIT backends
+verify identical under four chaos seeds.  Over the whole Node run the
+JIT made 5288 page translations (4800 of them smc-burst
+retranslations), 104 MB of wasm, 1.9 s of translation + compile +
+instantiation in all, and took 12.2 M deopt exits.
+
+### 4.7 What a compiled page costs (Phase 0)
+
+Per page, averaged over the run (Node; `ppc_jit_split`): translate
+(C, guest code to wasm bytes) **0.040 ms**, `new WebAssembly.Module`
+0.048 ms, `new WebAssembly.Instance` 0.126 ms, first call 0.106 ms,
+second call 0.0003 ms.  The first call is where V8 actually compiles:
+it compiles wasm **lazily**, function by function at first call, so
+`WebAssembly.compile` off the main thread does not by itself keep
+compilation off the calling thread.  `tools/jit-lab` measures this on
+the 20 dumped pages of a smaller run (`JIT_DUMP=dir`); the cost to the
+thread that runs the code, per page, in ms:
+
+| how the module is obtained | engine | get module | Instance | first call | second call |
+|---|---|---|---|---|---|
+| `new Module` (sync) | Node | 0.364 | 0.061 | 1.470 | 0.006 |
+| `WebAssembly.compile` (async) | Node | 0.043 | 0.058 | 1.456 | 0.004 |
+| compiled on a worker, posted | Node | 0 | 0.044 | 2.345 | 0.007 |
+| **compiled and called once on a worker, posted** | Node | 0 | 0.056 | **0.012** | 0.001 |
+| sync, `--no-wasm-lazy-compilation` | Node | 1.912 | 0.035 | 0.003 | 0.001 |
+| async, `--no-wasm-lazy-compilation` | Node | 0.057 | 0.039 | 0.008 | 0.001 |
+| `WebAssembly.compile` (async) | Chromium | 0.255 | 1.090 | 5.525 | 0 |
+| compiled on a worker, posted | Chromium | 0 | 0.135 | 4.700 | 0 |
+| **compiled and called once on a worker, posted** | Chromium | 0 | 0.075 | **0.080** | 0 |
+
+A browser cannot pass V8 flags, so the usable recipe is the bold rows:
+the translator worker compiles the module, instantiates it against
+scratch memory and calls it once with a zero budget (the first block's
+guard leaves at once), then posts the Module.  The compiled code travels
+with the Module, and the core thread pays ~0.07 ms (Node) to ~0.15 ms
+(Chromium) per page to instantiate and first-call it, instead of
+1.5–5.5 ms of compilation at first call.
 
 ## 5. Analysis
 
@@ -410,11 +496,15 @@ allocates to host registers, and turns in-page control flow into wasm
 branches; the remaining per-instruction cost is the work itself (an add
 is an add; a load is the inlined SoA lookup plus the byte swap).  The
 gain is largest where the interpreter's dispatch was least predictable
-(dispatch-stress, 4–6×) and smallest on the memory kernel, where the
+(dispatch-stress, 7–8×) and smallest on the memory kernel, where the
 inlined fast path dominates both.  Its costs are the ones §1 names:
-translation and compilation time (here ~0.5 ms per page, paid once per
+translation and compilation time (~0.3 ms per page on the core thread
+here, ~0.1 ms when a worker compiles and warms it, §4.7; paid once per
 page version) and, for a real system, everything this subset leaves out
-(§6).
+(§6).  Exits are cheap enough that a 2% rate of device accesses, each a
+deopt to the interpreter for one instruction, still leaves 5× (io-mixed),
+and a page rewritten every 63 instructions still runs at 2× the switch
+interpreter once retranslation is throttled by cooling (smc-burst).
 
 ## 6. Threats to validity
 
@@ -444,15 +534,19 @@ page version) and, for a real system, everything this subset leaves out
 - **gcc-native backend B is not musttail** — it measures sibling-call
   codegen, not the guaranteed-tail-call regime.
 
-- **The JIT's friendliest case.**  Every kernel instruction is
-  translatable, nothing faults, there are no interrupts, no MMU, no
-  self-modifying code and no supervisor state.  A production JIT must
-  commit precise state at every possible exception (a data access fault
-  in mid-block), check interrupts at block boundaries, translate through
-  an MMU whose tables change, and retranslate when code pages are written
-  (the DR 68K emulator writes PowerPC code continuously).  Each adds
-  checks or exits the kernels here never pay; the 3–6× is an upper-end
-  figure for the code that remains, not a whole-system forecast.
+- **The JIT's remaining friendly cases.**  §2.6 adds device accesses
+  mid-block, self-modifying code and asynchronous install, but there are
+  still no interrupts, no MMU, no FPU and no supervisor state, and the
+  compile runs on the core thread (the async pipeline is modelled by the
+  chaos delay; its core-thread cost is measured separately in §4.7).  A
+  production JIT also translates through an MMU whose tables change, and
+  the DR 68K emulator writes PowerPC code continuously.  The 3–8× is an
+  upper-end figure for the code that remains, not a whole-system
+  forecast.
+- **jit-call's spill is naive.**  It stores all 36 guest registers at
+  every memory instruction's slow branch, which bloats the code and
+  costs it 2–2.6× against deopt on dispatch-stress; spilling only the
+  registers the block has written would close most of that gap.
 
 ## 7. Reproducing
 
@@ -464,6 +558,10 @@ node build/ppc-bench.js  [budget] [reps]     # §4.1
 node build/m68k-bench.js [budget] [reps]     # §4.4
 make run-browsers                            # Chromium/Firefox (npm i, or PW_CORE=<path>)
 node build/be-micro.js                       # §4.5
+BENCH_TIMEOUT_MS=1500000 make run-browsers   # §4.6: all 8 backends need >5 min
+JIT_DUMP=tools/jit-lab/dump node build/ppc-bench.js 20000000 1
+node tools/jit-lab/compile-node.mjs tools/jit-lab/dump worker-warm   # §4.7
+cd tools/jit-lab && PW_CORE=<path> node run-browser.mjs              # §4.7, Chromium
 ```
 
 Compile-time knobs: `make BENCH_DEFS='-DBENCH_DEFAULT_BUDGET=30000000

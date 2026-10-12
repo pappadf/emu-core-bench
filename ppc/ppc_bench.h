@@ -41,9 +41,15 @@ void ppc_run_pdx8(ppc_t *c, uint32_t budget);
 void ppc_run_pdx16(ppc_t *c, uint32_t budget);
 #ifdef __EMSCRIPTEN__
 void ppc_run_jit(ppc_t *c, uint32_t budget); // backend G: wasm JIT (wasm builds only)
+void ppc_run_jit_call(ppc_t *c, uint32_t budget); // G': slow paths called from the translation
+uint32_t ppc_jit_deopts(void);
+uint32_t ppc_jit_invalidations(void);
+extern uint32_t g_jit_chaos_seed;
+void ppc_jit_reset(void); // drop every translation (chaos verification starts cold)
 uint32_t ppc_jit_compiles(void);
 uint32_t ppc_jit_compile_bytes(void);
 double ppc_jit_compile_ms(void);
+void ppc_jit_split(double *translate, double *module, double *instance, double *first_call, double *second_call);
 #endif
 
 // Fatal diagnostic for opcodes outside the benchmark subset (bench_main.c)

@@ -39,6 +39,12 @@ void ppc_run_call(ppc_t *c, uint32_t budget);
 void ppc_run_pd(ppc_t *c, uint32_t budget);
 void ppc_run_pdx8(ppc_t *c, uint32_t budget);
 void ppc_run_pdx16(ppc_t *c, uint32_t budget);
+#ifdef __EMSCRIPTEN__
+void ppc_run_jit(ppc_t *c, uint32_t budget); // backend G: wasm JIT (wasm builds only)
+uint32_t ppc_jit_compiles(void);
+uint32_t ppc_jit_compile_bytes(void);
+double ppc_jit_compile_ms(void);
+#endif
 
 // Fatal diagnostic for opcodes outside the benchmark subset (bench_main.c)
 void ppc_illegal(ppc_t *c, uint32_t insn);

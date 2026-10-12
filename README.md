@@ -39,6 +39,14 @@ optimal C-expressible emulator core on today's wasm engines is a flat
 per-instruction predecoded format**, with the id space (not entry width)
 carrying the specialization.
 
+A seventh PPC backend (G, `ppc/ppc_jit.c`) then tests the step past
+interpretation: a **WebAssembly JIT** that translates each guest code page
+into one wasm function at run time (generated from C, instantiated
+synchronously against the module's own memory and table, called through a
+C function pointer).  On V8 it runs **2.8–5.5× faster than the best
+interpreter** (pdx-8B), verified bit-identical, for about 0.5 ms of
+translation and compilation per page (§2.5, §4.6).
+
 ## 1. Introduction
 
 Interpreter dispatch is one of the most retold performance stories in
@@ -59,9 +67,12 @@ different regime:
   typed-reference form (`call_ref`) exists in the spec (WasmGC) but is
   unreachable from C/LLVM, which lowers all function pointers to indices
   into an untyped `funcref` table.
-- Runtime code generation from inside a module is impossible; JIT-style
-  translation requires round-tripping generated modules through JavaScript
-  — out of scope for projects committed to plain portable C.
+- Runtime code generation inside a module is impossible: a JIT emits a
+  new module's bytes into linear memory and has JavaScript compile and
+  instantiate it (`new WebAssembly.Module` / `Instance`, synchronous off
+  the browser's main thread and in Node), importing the emitting module's
+  memory and function table.  Backend G (§2.5) does exactly that, with
+  one small `EM_JS` shim and everything else in C.
 
 Within those constraints, the classical alternative to better dispatch is a
 better *intermediate format*: predecode the guest code once into a side
@@ -205,6 +216,45 @@ registers, pc and all of RAM must still match bit-for-bit — the kernels
 branch on flags constantly, so unsound elision diverges that hash
 immediately.
 
+### 2.5 Backend G: a WebAssembly JIT (`ppc/ppc_jit.c`, wasm builds only)
+
+The translation unit is one 4 KB guest code page (1024 instructions),
+translated on first entry into one wasm function
+`(ppc_t *, budget, entry block) -> budget left`:
+
+- **Guest registers live in wasm locals**: all 32 GPRs, CR, CTR, LR and
+  XER.CA are loaded at function entry and stored at exit, so the engine's
+  register allocator, not linear memory, holds the guest state while the
+  page runs.
+- **Control flow stays inside the function.**  Basic-block leaders are
+  the page start, in-page branch targets, the instruction after each
+  branch, and entry points seen at run time.  The blocks are laid out in
+  address order as nested wasm `block`s inside one `loop`, entered
+  through a `br_table` on the block index: fallthrough is the nesting
+  order, and an in-page branch is `idx = j; br $loop`.  A loop that stays
+  in its page (alu-loop, mem-stream) runs entirely inside one call.
+- **Budget exactness**: each block compares the remaining budget with
+  its known length before running, and leaves at its start when it would
+  overrun; the switch interpreter runs the tail.  A run executes exactly
+  `budget` instructions, as for every backend.
+- **Memory** is inlined with `mem_fastpath.h`'s structure: masked
+  address, SoA entry load (the table pointers and mask are loaded once per
+  call), page-crossing test, byte swap as two rotates and two masks (wasm
+  has no bswap), the value-trap load-and-branch on stores, and
+  `call_indirect` into the C slow paths (C function pointers are table
+  indices).
+- **Exits**: a branch out of the page, an indirect branch (bclr/bcctr) or
+  an instruction outside the subset leaves with the pc in the state; the C
+  dispatcher looks the target page up and calls its function — one
+  indirect call per page entry, not per instruction.
+- **Code coherence**: a translated page keeps a copy of its bytes and is
+  revalidated against guest RAM the first time each run enters it (the
+  stand-in for write invalidation; translations are reused across runs
+  when unchanged).  Compile time is charged to the run that compiles.
+
+Native builds have no runtime code generation, so G is in the wasm
+binaries only.
+
 ## 3. Experimental setup
 
 | component | value |
@@ -277,6 +327,23 @@ little-endian load, identical address streams: **−4.1%** independent /
 the rotate idiom literally: −12…−20%, a pessimization).  Use the intrinsic,
 always; the swap is a minor cost and unimprovable from C.
 
+### 4.6 Backend G, the wasm JIT (100 M instructions, best of 5)
+
+Node 22 (V8; a second pass in parentheses) and Chromium 153 (playwright),
+2026-10-12, on the same class of shared cloud host as §3:
+
+| kernel | switch | pdx-8B | wasm-jit (Node) | wasm-jit (Chromium) | G vs pdx-8B |
+|---|---|---|---|---|---|
+| alu-loop | 208–228 MIPS | 371–377 | **1324 (1341)** | **1259** (pdx-8B 342) | 3.5–3.7× |
+| mem-stream | 225 MIPS | 487–515 | **1360 (1359)** | **1745** (pdx-8B 543) | 2.6–3.2× |
+| dispatch-stress | 54–60 MIPS | 106–112 | **456 (667)** | **516** (pdx-8B 93) | 4.1–6.3× |
+
+All seven backends verify identical on every kernel (registers, pc, CR,
+CTR, LR, XER.CA and all 8 MB of RAM).  The whole benchmark translates 20
+pages into 690 KB of wasm, in 10–13 ms of translation, synchronous
+compilation (V8's baseline tier) and instantiation together; the engine's
+optimizing tier then recompiles hot functions in the background.
+
 ## 5. Analysis
 
 **5.1 The indirect-call tax, isolated.**  B and C share small per-opcode
@@ -334,6 +401,21 @@ stores take a slow path that invalidates), and treating the cache as
 derived data for snapshot/restore; (v) re-measure tail calls only if
 engines gain signature-elided indirect calls.
 
+**5.6 The JIT removes the interpreter, not just its dispatch.**  The
+interpreter backends pay a fixed cost per guest instruction whatever the
+format: an entry load, a dispatch through `br_table`, operand access
+through linear memory, the budget decrement.  Backend G pays one budget
+check per basic block, keeps the registers in locals the engine
+allocates to host registers, and turns in-page control flow into wasm
+branches; the remaining per-instruction cost is the work itself (an add
+is an add; a load is the inlined SoA lookup plus the byte swap).  The
+gain is largest where the interpreter's dispatch was least predictable
+(dispatch-stress, 4–6×) and smallest on the memory kernel, where the
+inlined fast path dominates both.  Its costs are the ones §1 names:
+translation and compilation time (here ~0.5 ms per page, paid once per
+page version) and, for a real system, everything this subset leaves out
+(§6).
+
 ## 6. Threats to validity
 
 - **Shared cloud CPU.**  2 vCPUs of a multi-tenant Xeon; absolute MIPS vary
@@ -361,6 +443,16 @@ engines gain signature-elided indirect calls.
   the Firefox datapoint is compromised (§4.2); JavaScriptCore is unmeasured.
 - **gcc-native backend B is not musttail** — it measures sibling-call
   codegen, not the guaranteed-tail-call regime.
+
+- **The JIT's friendliest case.**  Every kernel instruction is
+  translatable, nothing faults, there are no interrupts, no MMU, no
+  self-modifying code and no supervisor state.  A production JIT must
+  commit precise state at every possible exception (a data access fault
+  in mid-block), check interrupts at block boundaries, translate through
+  an MMU whose tables change, and retranslate when code pages are written
+  (the DR 68K emulator writes PowerPC code continuously).  Each adds
+  checks or exits the kernels here never pay; the 3–6× is an upper-end
+  figure for the code that remains, not a whole-system forecast.
 
 ## 7. Reproducing
 

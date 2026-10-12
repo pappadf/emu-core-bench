@@ -251,11 +251,23 @@ static double now_ms(void) {
 }
 
 typedef void run_fn(ppc_t *c, uint32_t budget);
+#ifdef __EMSCRIPTEN__
+#define NBACKENDS 7 // + G: the wasm JIT (runtime code generation needs a wasm host)
+#else
 #define NBACKENDS 6
+#endif
 static run_fn *const g_backends[NBACKENDS] = { ppc_run_switch, ppc_run_tail, ppc_run_call,
-                                               ppc_run_pd, ppc_run_pdx8, ppc_run_pdx16 };
+                                               ppc_run_pd, ppc_run_pdx8, ppc_run_pdx16
+#ifdef __EMSCRIPTEN__
+                                               , ppc_run_jit
+#endif
+};
 static const char *const g_backend_names[NBACKENDS] = { "switch", "tail-call", "call-loop",
-                                                        "pd-raw", "pdx-8B", "pdx-16B" };
+                                                        "pd-raw", "pdx-8B", "pdx-16B"
+#ifdef __EMSCRIPTEN__
+                                                        , "wasm-jit"
+#endif
+};
 static const char *const g_kernel_names[3] = { "alu-loop", "mem-stream", "dispatch-stress" };
 
 #ifndef BENCH_DEFAULT_BUDGET
@@ -331,6 +343,10 @@ int main(int argc, char **argv) {
                 printf("  (%+.1f%%)\n", (mips[b] / mips[0] - 1.0) * 100.0);
         }
     }
+#ifdef __EMSCRIPTEN__
+    printf("wasm-jit: %u page translations, %u bytes of wasm, %.1f ms translating + compiling in all\n",
+           ppc_jit_compiles(), ppc_jit_compile_bytes(), ppc_jit_compile_ms());
+#endif
     printf("benchmark done\n");
     return 0;
 }

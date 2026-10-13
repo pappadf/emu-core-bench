@@ -41,10 +41,20 @@ void ppc_run_pdx8(ppc_t *c, uint32_t budget);
 void ppc_run_pdx16(ppc_t *c, uint32_t budget);
 #ifdef __EMSCRIPTEN__
 void ppc_run_jit(ppc_t *c, uint32_t budget); // backend G: wasm JIT (wasm builds only)
-void ppc_run_jit_call(ppc_t *c, uint32_t budget); // G': slow paths called from the translation
+void ppc_run_jit_call(ppc_t *c, uint32_t budget);
+void ppc_run_jit_chain(ppc_t *c, uint32_t budget); // A2: page functions chained by tail call
+void ppc_run_jit_region(ppc_t *c, uint32_t budget); // A2: one function per 1 MB region
+void ppc_run_jit_lazy(ppc_t *c, uint32_t budget); // A2: page functions, only the named registers
+uint32_t ppc_jit_calls(void);
+void ppc_run_jit_block(ppc_t *c, uint32_t budget); // A2: block-granular invalidation
+uint32_t ppc_jit_block_invals(void);
+void ppc_run_jit_rblock(ppc_t *c, uint32_t budget); // A2: region + block-granular invalidation // G': slow paths called from the translation
 uint32_t ppc_jit_deopts(void);
 uint32_t ppc_jit_invalidations(void);
 extern uint32_t g_jit_chaos_seed;
+extern uint32_t g_region_shift; // log2 of the region size (A2 region variants), at most 20
+extern uint32_t g_chunk_cap; // instructions per region chunk (A2 region variants)
+extern uint32_t g_jit_sprint; // the most one call into a translation may run (0: no limit)
 void ppc_jit_reset(void); // drop every translation (chaos verification starts cold)
 uint32_t ppc_jit_compiles(void);
 uint32_t ppc_jit_compile_bytes(void);

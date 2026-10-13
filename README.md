@@ -302,6 +302,48 @@ does the design stay exact, and what does it cost?
   each instantiation slowed with it (smc-burst ran at 101 MIPS, below
   the switch interpreter; with reuse, 568).
 
+### 2.7 Phase A2: the translation unit
+
+The page-heat profile of the real machines (2026-10-12) found 3–15
+instructions per page visit, where §2.5's kernels run hundreds.  Two more
+kernels reproduce what the profile found:
+
+- **emu68k**: an interpretive 68K emulator shaped like the 601 ROM's —
+  fetch an opcode, index a table of one-instruction entries (`b handler`),
+  run a 0–3-instruction handler in one of 12 handler pages, branch back to
+  a shared fetch page.  About 3.5 instructions per page visit (pm6100
+  desktop: 3.4).
+- **dr-patch**: a code page used like the pm8500's DR translation cache —
+  eight routines, six called per round; every round stores into the data
+  word after a routine's `blr` (a link field beside code), every 128th
+  round rewrites a word of code.  The profile found a store next to code
+  every ~70 instructions and a store into code every ~10 K.
+
+and the JIT gains variants (`ppc_jit.c`; each keeps its own translations):
+
+| variant | unit | slow path | invalidation |
+|---|---|---|---|
+| wasm-jit (G) | page | deopt | page, any store |
+| jit-call (G') | page | spill + call | page, any store |
+| jit-chain | page, exits `return_call_indirect` the next page's function, registers as arguments | deopt | page, any store |
+| jit-lazy | page, loads/stores only the registers it names | deopt | page, any store |
+| jit-region | the entered, never-written pages of 1 MB in one function; indirect branches looked up inside | deopt | written pages leave the region |
+| jit-blockinv | page; each block checks a valid flag | deopt | only the blocks covering the stored words |
+| jit-rgn-blk | region + the block flags | deopt | blocks |
+
+The region variants split a region's reachable code into **chunks** of at
+most 4096 instructions, whole blocks in address order, one function each;
+a branch to another chunk's block leaves and the dispatcher enters that
+chunk.  Without the cap, V8's optimizing compiler took 11 s for a 660 KB
+region function (`--trace-wasm-compilation-times`), and until then the
+function ran as baseline code (dispatch-stress: 62 MIPS, 827 with
+`--no-liftoff`); its cost grows faster than linearly (127 KB: 0.28 s,
+168 KB: 0.56 s).
+
+Every (kernel, backend) pair is measured in a process of its own
+(`tools/a2-run.sh`): in one process, the translations of earlier kernels
+and variants slowed later ones by up to 2× (§6).
+
 ## 3. Experimental setup
 
 | component | value |
@@ -430,6 +472,25 @@ with the Module, and the core thread pays ~0.07 ms (Node) to ~0.15 ms
 (Chromium) per page to instantiate and first-call it, instead of
 1.5–5.5 ms of compilation at first call.
 
+### 4.8 Phase A2 (100 M instructions, best of 5, each pair in its own process)
+
+Node 22, 2026-10-13 (`results-a2-node.log`).  MIPS; switch is the median
+of the per-process reference runs.
+
+| kernel | switch | pdx-8B | G | G' | chain | lazy | blockinv | region | **rgn-blk** |
+|---|---|---|---|---|---|---|---|---|---|
+| alu-loop | 209 | 363 | 1338 | 1281 | 1503 | 1342 | 1511 | 1555 | 1296 |
+| mem-stream | 224 | 490 | 1852 | 1595 | 1715 | 1620 | 1769 | 1584 | 1821 |
+| dispatch-stress | 57 | 97 | 823 | 424 | 870 | 748 | 847 | 1007 | 673 |
+| io-mixed | 72 | 102 | 458 | 607 | 414 | 396 | 453 | 463 | 292 |
+| smc-burst | 237 | n/a | 928 | 748 | 1066 | 910 | 683 | 697 | 1272 |
+| **emu68k** | 152 | 291 | 144 | 133 | 234 | 162 | 128 | 344 | **356** |
+| **dr-patch** | 207 | n/a | 13 | 14 | 13 | 13 | 222 | 13 | **202** |
+
+(region and rgn-blk: chunked, 4096 instructions; the same kernels with one
+function per region: dispatch-stress 62 and 55.)  All verify identical,
+under the four chaos seeds too.
+
 ## 5. Analysis
 
 **5.1 The indirect-call tax, isolated.**  B and C share small per-opcode
@@ -506,6 +567,25 @@ deopt to the interpreter for one instruction, still leaves 5× (io-mixed),
 and a page rewritten every 63 instructions still runs at 2–2.4× the switch
 interpreter once retranslation is throttled by cooling (smc-burst).
 
+**5.7 The unit is a chunked region, invalidated by block.**  At 3–4
+instructions per page visit (emu68k) every page-sized unit loses to the
+predecoded interpreter: page functions (144 MIPS), page functions with
+only the named registers (162) or chained by tail call (234) against 291.
+Only a unit that spans the handler pages keeps the transitions inside
+one function: the region, 344–356, 1.2× the interpreter.  That is the
+whole gain on this shape: a 68K emulator dispatches through `bctr` every
+3–4 instructions, and each costs a lookup and a `br_table` in any unit.
+On the DR-cache shape, invalidating a translation on any store into its
+page loses 16× (13 MIPS: every link-field store forces a retranslation);
+invalidating only the blocks that translated the stored words keeps the
+interpreter's speed (202–222) — no gain, because each link-field store
+still leaves the translation (a code page's stores take the slow path).
+The block flags cost up to a third on dense branchy code (dispatch-stress
+673 vs 1007, io-mixed 292 vs 463); stores can only invalidate between
+calls, so only pages with a history of writes need them, and the others
+can check validity once per page entry.  And a function's size must be
+capped: the optimizing tier's compile time is superlinear in it.
+
 ## 6. Threats to validity
 
 - **Shared cloud CPU.**  2 vCPUs of a multi-tenant Xeon; absolute MIPS vary
@@ -543,6 +623,9 @@ interpreter once retranslation is throttled by cooling (smc-burst).
   the DR 68K emulator writes PowerPC code continuously.  The 3–7.6× is an
   upper-end figure for the code that remains, not a whole-system
   forecast.
+- **One engine per measurement.**  Translations accumulate in the engine:
+  measured in one process, the region variant ran at less than half the
+  speed it has in a process of its own.  §4.8's pairs each run alone.
 - **jit-call's spill is naive.**  It stores all 36 guest registers at
   every memory instruction's slow branch, which bloats the code and
   costs it 2–2.6× against deopt on dispatch-stress; spilling only the
@@ -559,6 +642,10 @@ node build/m68k-bench.js [budget] [reps]     # §4.4
 make run-browsers                            # Chromium/Firefox (npm i, or PW_CORE=<path>)
 node build/be-micro.js                       # §4.5
 BENCH_TIMEOUT_MS=1500000 make run-browsers   # §4.6: all 8 backends need >5 min
+tools/a2-run.sh                              # §4.8: every (kernel, backend) in its own process
+node build/ppc-bench.js BUDGET REPS KMASK BMASK SPRINT RSHIFT CAP
+    # filters and A2 knobs: kernel and backend bit masks, the most one call
+    # into a translation runs (0: all), log2 region size, chunk cap
 JIT_DUMP=tools/jit-lab/dump node build/ppc-bench.js 20000000 1
 node tools/jit-lab/compile-node.mjs tools/jit-lab/dump worker-warm   # §4.7
 cd tools/jit-lab && PW_CORE=<path> node run-browser.mjs              # §4.7, Chromium

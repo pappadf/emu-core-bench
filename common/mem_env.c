@@ -46,6 +46,7 @@ static uint8_t *g_code_marks; // per page
 static uint32_t *g_marked_list;
 static uint32_t g_marked_count, g_pages_total;
 void (*g_code_write_hook)(uint32_t page);
+uint32_t g_code_write_addr, g_code_write_size;
 
 void mem_env_code_mark(uint32_t page) {
     if (g_code_marks[page])
@@ -83,6 +84,8 @@ static bool code_store(uint32_t addr, uint32_t v, unsigned size) {
     for (unsigned i = 0; i < size; i++)
         g_ram[(addr + i) & g_address_mask] = (uint8_t)(v >> (8 * (size - 1 - i)));
     if (g_code_write_hook) {
+        g_code_write_addr = addr;
+        g_code_write_size = size;
         g_code_write_hook(page);
         if (last != page)
             g_code_write_hook(last);

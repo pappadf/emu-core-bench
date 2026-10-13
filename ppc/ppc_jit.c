@@ -113,9 +113,9 @@ static void sleb(int32_t v) {
 // wasm opcodes used here
 enum {
     W_BLOCK = 0x02, W_LOOP = 0x03, W_IF = 0x04, W_ELSE = 0x05, W_END = 0x0B, W_BR = 0x0C, W_BR_TABLE = 0x0E,
-    W_CALL_INDIRECT = 0x11, W_SELECT = 0x1B, W_LGET = 0x20, W_LSET = 0x21, W_LTEE = 0x22,
+    W_BR_IF = 0x0D, W_CALL_INDIRECT = 0x11, W_RETURN_CALL_INDIRECT = 0x13, W_SELECT = 0x1B, W_LGET = 0x20, W_LSET = 0x21, W_LTEE = 0x22,
     W_LOAD = 0x28, W_LOAD8U = 0x2D, W_LOAD16U = 0x2F, W_STORE = 0x36, W_STORE8 = 0x3A, W_STORE16 = 0x3B,
-    W_CONST = 0x41, W_EQZ = 0x45, W_NE = 0x47, W_LT_S = 0x48, W_LT_U = 0x49, W_GT_S = 0x4A, W_GT_U = 0x4B,
+    W_CONST = 0x41, W_EQZ = 0x45, W_EQ = 0x46, W_NE = 0x47, W_GE_U = 0x4F, W_LT_S = 0x48, W_LT_U = 0x49, W_GT_S = 0x4A, W_GT_U = 0x4B,
     W_ADD = 0x6A, W_SUB = 0x6B, W_MUL = 0x6C, W_AND = 0x71, W_OR = 0x72, W_XOR = 0x73, W_SHL = 0x74,
     W_SHR_S = 0x75, W_SHR_U = 0x76, W_ROTL = 0x77, W_ROTR = 0x78,
 };
@@ -148,13 +148,16 @@ static void mem(uint8_t o, uint32_t align, uint32_t off) {
 }
 
 // Function types of the module (index order of the type section)
-enum { TY_PAGE, TY_RD, TY_WR, TY_TRAP }; // (i32,i32,i32)->i32, (i32)->i32, (i32,i32)->(), (i32,i32,i32)->()
+enum { TY_PAGE, TY_RD, TY_WR, TY_TRAP, TY_CHAIN }; // (i32,i32,i32)->i32, (i32)->i32, (i32,i32)->(), (i32,i32,i32)->(),
+                                                   // (c, budget, entry, r0..r31, cr, ctr, lr, ca)->i32
+#define CHAIN_PARAMS 39
 
 // Locals: params 0..2, then the guest state and temporaries
 enum {
     L_C = 0, L_BUDGET = 1, L_ENTRY = 2,
     L_GPR = 3, // 32 of them
     L_CR = L_GPR + 32, L_CTR, L_LR, L_CA, L_IDX, L_NPC, L_RTAB, L_WTAB, L_AMASK, L_T0, L_T1, L_T2, L_T3, L_EA, L_EPOCH,
+    L_STOP, // 1: this exit made no progress (a budget guard, an untranslatable block): never chain from it
     L_COUNT
 };
 #define NLOCALS (L_COUNT - 3)
@@ -166,12 +169,18 @@ enum {
 
 typedef struct jit_page {
     uint32_t fn; // table index of the translation (0: none)
-    uint32_t gen; // run generation it was last validated in
     uint16_t blk_of[PAGE_INSNS]; // block index of a leader, NONE16 otherwise
     uint8_t extra[PAGE_INSNS]; // leaders added for entries seen at run time
     uint8_t bytes[MEM_PAGE_SIZE]; // the page as translated (validation copy)
     uint32_t cooling; // entries left to run interpreted after a code write (0: translate on entry)
     uint32_t pending; // chaos mode: entries left before the translation "arrives" (0: none pending)
+    uint8_t written; // region variant: the page was written, it runs as a page function
+    // Block-granular invalidation (V_BLOCK): a store kills only the blocks
+    // that cover the words it wrote; each block checks its flag on entry.
+    uint8_t bvalid[PAGE_INSNS + 1]; // per block: 1 = valid (read by the translation)
+    uint16_t cov[PAGE_INSNS]; // per word: the block that translated it, or NONE16
+    uint32_t stale; // blocks invalidated since the page was translated
+    uint32_t quiet; // entries since the last such store
 } jit_page_t;
 
 // Chaos mode (seed != 0): a translation becomes available only after a
@@ -180,6 +189,7 @@ typedef struct jit_page {
 // translations is outside the guest's control, and the guest state must not
 // depend on it.  The verification runs every kernel under several seeds.
 uint32_t g_jit_chaos_seed;
+uint32_t g_jit_sprint; // the most one call may run (0: no limit; bench argument 5)
 static uint32_t g_chaos_state;
 
 // After a write invalidates a page's translation, the page is entered this
@@ -194,12 +204,11 @@ static uint32_t g_chaos_state;
 // store invalidated code (possibly its own page).
 uint32_t g_code_epoch;
 
+enum { V_PAGE, V_CALL, V_CHAIN, V_REGION, V_LAZY, V_BLOCK, V_RBLOCK, NVARIANTS }; // the variants (Phase A2, below)
 static jit_page_t **g_pages; // per guest page (lazily allocated), of the current slow-path mode
-static jit_page_t **g_pages_by_mode[2]; // each slow-path mode keeps its own translations
+static jit_page_t **g_pages_by_mode[NVARIANTS]; // each variant keeps its own translations
 static uint32_t g_npages;
-static uint32_t g_gen;
 
-static uint32_t g_page_base; // guest address of the page being translated
 static uint32_t g_depth; // structured-control depth of the current point, relative to the block's code
 static uint32_t g_nblocks; // blocks in the page
 static uint32_t g_cur_block; // block being emitted
@@ -221,6 +230,38 @@ uint32_t g_jit_reason;
 // Both leave the state exact at the access.
 enum { JIT_SLOW_DEOPT = 0, JIT_SLOW_CALL = 1 };
 int g_jit_slow_mode = JIT_SLOW_DEOPT;
+
+// Phase A2: the translation unit.  Each variant keeps its own translations.
+//   chain:  a page function that leaves for a page that has a translation
+//           calls it directly (return_call_indirect), the guest registers
+//           passed as arguments, instead of returning to the C dispatcher;
+//   region: one function for the stable pages of a 1 MB region (the ones
+//           entered so far and never written), only the code reachable
+//           from their entry points; branches between its pages, indirect
+//           ones included, stay inside the function.  A page that is
+//           written leaves its region and runs as a page function;
+//   lazy:   the prologue loads, and the exits store, only the registers
+//           the function's instructions name;
+//   block:  page functions whose blocks each check a valid flag: a store
+//           into the page invalidates only the blocks covering the words it
+//           wrote (a store into data next to code invalidates nothing), and
+//           the page is retranslated once it has been quiet for a while.
+typedef struct jit_variant {
+    int slow;
+    bool chain, region, lazy, block;
+} jit_variant_t;
+static const jit_variant_t g_variants[NVARIANTS] = {
+    [V_PAGE] = {JIT_SLOW_DEOPT, false, false, false},
+    [V_CALL] = {JIT_SLOW_CALL, false, false, false},
+    [V_CHAIN] = {JIT_SLOW_DEOPT, true, false, false},
+    [V_REGION] = {JIT_SLOW_DEOPT, false, true, false},
+    [V_LAZY] = {JIT_SLOW_DEOPT, false, false, true},
+    [V_BLOCK] = {JIT_SLOW_DEOPT, false, false, false, true},
+    [V_RBLOCK] = {JIT_SLOW_DEOPT, false, true, false, true}, // region + block-granular invalidation
+};
+static const jit_variant_t *g_v = &g_variants[V_PAGE];
+static bool g_emit_chain; // the unit being translated is a chained page function
+static uint32_t g_reg_mask; // GPRs the unit loads and stores (all, unless lazy)
 
 // Depths of the two branch targets from the code of block i (no `if` open):
 // the still-open blocks $b(i+1)..$b(n-1), then $loop, then $out.
@@ -245,21 +286,111 @@ static void emit_exit_stack(void) {
     uleb(depth_out());
 }
 
-static uint16_t *g_blk_of; // the page's leader -> block map, during translation
+// The unit being translated: one page, or the member pages of a region.
+// Each page's map gives the unit-wide block index of every leader.
+// The region size is a run-time choice (bench argument 6, log2 bytes, at
+// most 20): the engine's optimizing compile grows faster than linearly
+// with a function's size, so the size of a region bounds that cost.
+#define REGION_MAX_PAGES 256
+uint32_t g_region_shift = 20;
+#define REGION_SHIFT g_region_shift
+#define REGION_BYTES (1u << REGION_SHIFT)
+#define REGION_PAGES (REGION_BYTES >> PAGE_SHIFT)
+typedef struct unit_page {
+    uint32_t base;
+    const uint32_t *words;
+    const uint8_t *leader;
+    uint16_t *map;
+    uint16_t *cov; // block mode: per word, the block that translated it
+} unit_page_t;
+static unit_page_t *g_unit;
+static uint32_t g_unit_n;
+static int16_t g_unit_slot[REGION_MAX_PAGES]; // region mode: page within the region -> index in g_unit, or -1
+static uint32_t g_unit_rbase; // region mode: the region's guest base
+static uint32_t g_unit_pagemap; // region mode: address of the region's page -> map table (in linear memory)
+static uint8_t *g_unit_bvalid; // block mode: the unit's per-block valid flags (read by the translation)
 
-// Go to guest address `target`: a block of this page, or leave
+// The unit-wide block that starts at `target`, or NONE16
+static uint16_t unit_block_of(uint32_t target) {
+    if (target & 3)
+        return NONE16;
+    int k = -1;
+    if (g_unit_pagemap) {
+        uint32_t off = target - g_unit_rbase;
+        if (off < REGION_BYTES)
+            k = g_unit_slot[off >> PAGE_SHIFT];
+    } else if ((target & ~(uint32_t)PAGE_MASK) == g_unit[0].base) {
+        k = 0;
+    }
+    return k < 0 ? NONE16 : g_unit[k].map[(target & PAGE_MASK) >> 2];
+}
+
+// Go to guest address `target`: a block of this unit, or leave
 static void emit_goto(uint32_t target) {
-    if ((target & ~(uint32_t)PAGE_MASK) == g_page_base && !(target & 3)) {
-        uint16_t b = g_blk_of[(target & PAGE_MASK) >> 2];
-        if (b != NONE16) {
-            iconst(b);
-            lset(L_IDX);
-            op(W_BR);
-            uleb(depth_loop());
-            return;
-        }
+    uint16_t b = unit_block_of(target);
+    if (b != NONE16) {
+        iconst(b);
+        lset(L_IDX);
+        op(W_BR);
+        uleb(depth_loop());
+        return;
     }
     emit_exit_const(target);
+}
+
+// Go to the guest address on the stack (an indirect branch).  A region
+// looks it up in its maps and stays inside when the target is one of its
+// blocks; otherwise, leave.
+static void emit_jump_stack(void) {
+    if (!g_unit_pagemap) {
+        emit_exit_stack();
+        return;
+    }
+    lset(L_NPC);
+    op(W_BLOCK); // $miss
+    put(BT_VOID);
+    g_depth++;
+    lget(L_NPC);
+    iconst(g_unit_rbase);
+    op(W_SUB);
+    ltee(L_T0); // offset in the region
+    iconst(REGION_BYTES);
+    op(W_GE_U);
+    op(W_BR_IF);
+    uleb(0);
+    lget(L_T0);
+    iconst(PAGE_SHIFT);
+    op(W_SHR_U);
+    iconst(2);
+    op(W_SHL);
+    iconst(g_unit_pagemap);
+    op(W_ADD);
+    mem(W_LOAD, 2, 0);
+    ltee(L_T1); // the page's map, or 0
+    op(W_EQZ);
+    op(W_BR_IF);
+    uleb(0);
+    lget(L_T1);
+    lget(L_T0);
+    iconst(PAGE_MASK & ~3u);
+    op(W_AND);
+    iconst(1);
+    op(W_SHR_U); // (offset in page / 4) * 2
+    op(W_ADD);
+    mem(W_LOAD16U, 1, 0);
+    ltee(L_T1);
+    iconst(NONE16);
+    op(W_EQ);
+    op(W_BR_IF);
+    uleb(0);
+    lget(L_T1);
+    lset(L_IDX);
+    op(W_BR);
+    uleb(depth_loop());
+    op(W_END); // $miss: leave with L_NPC
+    g_depth--;
+    op(W_BR);
+    uleb(depth_out());
 }
 
 // Leave at the current instruction for the interpreter: give back the budget
@@ -280,6 +411,8 @@ static void emit_deopt(void) {
 // may observe it)
 static void emit_spill(void) {
     for (int r = 0; r < 32; r++) {
+        if (!(g_reg_mask & (1u << r)))
+            continue;
         lget(L_C);
         lget(GPR(r));
         mem(W_STORE, 2, (uint32_t)offsetof(ppc_t, gpr) + 4u * r);
@@ -630,7 +763,7 @@ static void emit_insn(uint32_t addr, uint32_t insn) {
         put(BT_VOID);
         g_depth++;
         lget(L_T3);
-        emit_exit_stack();
+        emit_jump_stack();
         op(W_END);
         g_depth--;
         return;
@@ -910,25 +1043,61 @@ static void put_name(const char *s) {
         put((uint8_t)*s++);
 }
 
-// Translate the page at `base` (its words in `words`) with the leaders in
-// `leader`; fills blk_of.  Returns the module length in g_buf.
-static void translate(uint32_t base, const uint32_t *words, const uint8_t *leader, uint16_t *blk_of) {
+// Registers an instruction names: a superset of the ones it reads or
+// writes (the D-form immediate's high bits count as rB).  Branches name none.
+static uint32_t insn_regs(uint32_t insn) {
+    uint32_t o = insn >> 26;
+    if (o == 16 || o == 18 || o == 19)
+        return 0;
+    return (1u << P_RD(insn)) | (1u << P_RA(insn)) | (1u << P_RB(insn));
+}
+
+// Translate the unit in g_unit (one page, or a region's member pages) with
+// the leaders each page gives; fills the pages' maps with unit-wide block
+// indices.  The module is left in g_buf.
+static void translate(void) {
     g_len = 0;
-    g_page_base = base;
-    g_blk_of = blk_of;
-    // Blocks: [start, end) instruction ranges.  An untranslatable word is a
-    // block of its own with no executable instructions: it only leaves.
-    static uint16_t bstart[PAGE_INSNS + 1];
-    uint32_t nb = 0;
-    for (uint32_t i = 0; i < PAGE_INSNS; i++) {
-        blk_of[i] = NONE16;
-        if (leader[i])
-            bstart[nb++] = (uint16_t)i;
+    // Blocks, unit-wide, in unit order: (page, first instruction, length).
+    // An untranslatable word is a block of its own of length 0: it leaves.
+    static uint32_t *bpage, *bstart, *blen, bcap;
+    uint32_t need = g_unit_n * PAGE_INSNS + 1;
+    if (need > bcap) {
+        bcap = need;
+        bpage = realloc(bpage, bcap * sizeof *bpage);
+        bstart = realloc(bstart, bcap * sizeof *bstart);
+        blen = realloc(blen, bcap * sizeof *blen);
     }
-    for (uint32_t b = 0; b < nb; b++)
-        blk_of[bstart[b]] = (uint16_t)b;
-    bstart[nb] = PAGE_INSNS;
+    uint32_t nb = 0;
+    g_reg_mask = g_v->lazy ? 0 : ~0u;
+    for (uint32_t k = 0; k < g_unit_n; k++) {
+        const unit_page_t *u = &g_unit[k];
+        for (uint32_t i = 0; i < PAGE_INSNS; i++) {
+            u->map[i] = NONE16;
+            if (!u->leader[i])
+                continue;
+            if (nb >= NONE16) {
+                fprintf(stderr, "FATAL: jit unit has too many blocks\n");
+                exit(1);
+            }
+            u->map[i] = (uint16_t)nb;
+            bpage[nb] = k;
+            bstart[nb] = i;
+            uint32_t n = 0;
+            if (translatable(u->words[i])) {
+                for (uint32_t j = i; j < PAGE_INSNS; j++) {
+                    if (j > i && (u->leader[j] || !translatable(u->words[j])))
+                        break;
+                    n++;
+                    g_reg_mask |= insn_regs(u->words[j]);
+                    if (is_branch(u->words[j]))
+                        break;
+                }
+            }
+            blen[nb++] = n;
+        }
+    }
     g_nblocks = nb;
+    const uint32_t nparams = g_emit_chain ? CHAIN_PARAMS : 3;
 
     // Header
     static const uint8_t hdr[8] = {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00};
@@ -936,11 +1105,15 @@ static void translate(uint32_t base, const uint32_t *words, const uint8_t *leade
         put(hdr[i]);
     // Types
     uint32_t s = open_section();
-    uleb(4);
+    uleb(5);
     put(0x60); uleb(3); put(0x7F); put(0x7F); put(0x7F); uleb(1); put(0x7F); // TY_PAGE
     put(0x60); uleb(1); put(0x7F); uleb(1); put(0x7F); // TY_RD
     put(0x60); uleb(2); put(0x7F); put(0x7F); uleb(0); // TY_WR
     put(0x60); uleb(3); put(0x7F); put(0x7F); put(0x7F); uleb(0); // TY_TRAP
+    put(0x60); uleb(CHAIN_PARAMS); // TY_CHAIN
+    for (int i = 0; i < CHAIN_PARAMS; i++)
+        put(0x7F);
+    uleb(1); put(0x7F);
     section(1, s);
     // Imports: memory e.m, table e.t
     s = open_section();
@@ -951,7 +1124,7 @@ static void translate(uint32_t base, const uint32_t *words, const uint8_t *leade
     // Functions
     s = open_section();
     uleb(1);
-    uleb(TY_PAGE);
+    uleb(g_emit_chain ? TY_CHAIN : TY_PAGE);
     section(3, s);
     // Exports
     s = open_section();
@@ -967,19 +1140,24 @@ static void translate(uint32_t base, const uint32_t *words, const uint8_t *leade
     for (int i = 0; i < 5; i++)
         put(0);
     uleb(1);
-    uleb(NLOCALS);
+    uleb(L_COUNT - nparams);
     put(0x7F);
 
-    // Prologue: the guest state into locals, the memory-system pointers
-    for (int r = 0; r < 32; r++) {
-        lget(L_C);
-        mem(W_LOAD, 2, (uint32_t)offsetof(ppc_t, gpr) + 4u * r);
-        lset(GPR(r));
+    // Prologue: the guest state into locals (a chained function receives it
+    // as arguments), the memory-system pointers
+    if (!g_emit_chain) {
+        for (int r = 0; r < 32; r++) {
+            if (!(g_reg_mask & (1u << r)))
+                continue;
+            lget(L_C);
+            mem(W_LOAD, 2, (uint32_t)offsetof(ppc_t, gpr) + 4u * r);
+            lset(GPR(r));
+        }
+        lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, cr)); lset(L_CR);
+        lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, ctr)); lset(L_CTR);
+        lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, lr)); lset(L_LR);
+        lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, xer_ca)); lset(L_CA);
     }
-    lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, cr)); lset(L_CR);
-    lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, ctr)); lset(L_CTR);
-    lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, lr)); lset(L_LR);
-    lget(L_C); mem(W_LOAD, 2, offsetof(ppc_t, xer_ca)); lset(L_CA);
     iconst(fp(&g_active_read)); mem(W_LOAD, 2, 0); lset(L_RTAB);
     iconst(fp(&g_active_write)); mem(W_LOAD, 2, 0); lset(L_WTAB);
     iconst(fp(&g_address_mask)); mem(W_LOAD, 2, 0); lset(L_AMASK);
@@ -1004,19 +1182,31 @@ static void translate(uint32_t base, const uint32_t *words, const uint8_t *leade
         op(W_END); // closes $b(b): what follows is block b's code
         g_cur_block = b;
         g_depth = 0;
-        uint32_t i0 = bstart[b], i1 = bstart[b + 1];
-        uint32_t addr0 = base + 4 * i0;
-        if (!translatable(words[i0])) {
+        const unit_page_t *u = &g_unit[bpage[b]];
+        uint32_t i0 = bstart[b], n = blen[b];
+        uint32_t addr0 = u->base + 4 * i0;
+        if (n == 0) {
+            iconst(1);
+            lset(L_STOP);
             emit_exit_const(addr0); // the C side runs it
             continue;
         }
-        // The block's length: up to the next leader, its first branch, or
-        // the first untranslatable word (which then must be a leader).
-        uint32_t n = 0;
-        for (uint32_t i = i0; i < i1; i++) {
-            n++;
-            if (is_branch(words[i]))
-                break;
+        if (g_unit_bvalid) {
+            // Block mode: leave (to the interpreter) if a store invalidated it
+            for (uint32_t i = i0; i < i0 + n; i++)
+                u->cov[i] = (uint16_t)b;
+            g_unit_bvalid[b] = 1;
+            iconst(fp(&g_unit_bvalid[b]));
+            mem(W_LOAD8U, 0, 0);
+            op(W_EQZ);
+            op(W_IF);
+            put(BT_VOID);
+            g_depth++;
+            iconst(1);
+            lset(L_STOP);
+            emit_exit_const(addr0);
+            op(W_END);
+            g_depth--;
         }
         // Budget: leave at the block's start if it would overrun
         lget(L_BUDGET);
@@ -1025,6 +1215,8 @@ static void translate(uint32_t base, const uint32_t *words, const uint8_t *leade
         op(W_IF);
         put(BT_VOID);
         g_depth++;
+        iconst(1);
+        lset(L_STOP);
         emit_exit_const(addr0);
         op(W_END);
         g_depth--;
@@ -1033,20 +1225,93 @@ static void translate(uint32_t base, const uint32_t *words, const uint8_t *leade
         op(W_SUB);
         lset(L_BUDGET);
         for (uint32_t i = i0; i < i0 + n; i++) {
-            g_cur_addr = base + 4 * i;
+            g_cur_addr = u->base + 4 * i;
             g_blk_left = i0 + n - i;
-            emit_insn(base + 4 * i, words[i]);
+            emit_insn(g_cur_addr, u->words[i]);
         }
-        // Fallthrough: into the next block's code; past the page: leave
-        if (b == nb - 1)
-            emit_exit_const(base + 4 * (i0 + n));
-        else if (i0 + n != i1) // (cannot happen: a branch ends at a leader)
-            emit_exit_const(base + 4 * (i0 + n));
+        // Fall through into the next block's code when it starts right
+        // here; otherwise go there (a block of the unit, or leave)
+        bool next_here = b + 1 < nb && bpage[b + 1] == bpage[b] && bstart[b + 1] == i0 + n;
+        if (!next_here)
+            emit_goto(u->base + 4 * (i0 + n));
     }
     op(W_END); // $loop (not reached by fallthrough: every path branches)
-    op(W_END); // $out
+    op(W_END); // $out: L_NPC holds the next pc
+    if (g_emit_chain) {
+        // Chain: when the next pc starts a block of a page that has a
+        // translation, call it directly with the registers -- unless this
+        // exit is a deopt (the interpreter runs the next instruction) or the
+        // budget is spent.
+        op(W_BLOCK); // $nochain
+        put(BT_VOID);
+        iconst(fp(&g_jit_reason));
+        mem(W_LOAD, 2, 0);
+        op(W_BR_IF);
+        uleb(0);
+        lget(L_STOP);
+        op(W_BR_IF);
+        uleb(0);
+        lget(L_BUDGET);
+        op(W_EQZ);
+        op(W_BR_IF);
+        uleb(0);
+        lget(L_NPC);
+        iconst(3);
+        op(W_AND);
+        op(W_BR_IF);
+        uleb(0);
+        lget(L_NPC);
+        lget(L_AMASK);
+        op(W_AND);
+        iconst(PAGE_SHIFT);
+        op(W_SHR_U);
+        iconst(2);
+        op(W_SHL);
+        iconst(fp(g_pages));
+        op(W_ADD);
+        mem(W_LOAD, 2, 0);
+        ltee(L_T0); // jit_page_t *, or 0
+        op(W_EQZ);
+        op(W_BR_IF);
+        uleb(0);
+        lget(L_T0);
+        mem(W_LOAD, 2, offsetof(jit_page_t, fn));
+        ltee(L_T1); // its translation, or 0
+        op(W_EQZ);
+        op(W_BR_IF);
+        uleb(0);
+        lget(L_T0);
+        lget(L_NPC);
+        iconst(PAGE_MASK & ~3u);
+        op(W_AND);
+        iconst(1);
+        op(W_SHR_U);
+        op(W_ADD);
+        mem(W_LOAD16U, 1, offsetof(jit_page_t, blk_of));
+        ltee(L_T2); // the entry block, or NONE16
+        iconst(NONE16);
+        op(W_EQ);
+        op(W_BR_IF);
+        uleb(0);
+        lget(L_C);
+        lget(L_BUDGET);
+        lget(L_T2);
+        for (int r = 0; r < 32; r++)
+            lget(GPR(r));
+        lget(L_CR);
+        lget(L_CTR);
+        lget(L_LR);
+        lget(L_CA);
+        lget(L_T1);
+        op(W_RETURN_CALL_INDIRECT);
+        uleb(TY_CHAIN);
+        put(0);
+        op(W_END); // $nochain
+    }
     // Epilogue: the state back, pc, remaining budget
     for (int r = 0; r < 32; r++) {
+        if (!(g_reg_mask & (1u << r)))
+            continue;
         lget(L_C);
         lget(GPR(r));
         mem(W_STORE, 2, (uint32_t)offsetof(ppc_t, gpr) + 4u * r);
@@ -1076,10 +1341,69 @@ static uint32_t g_deopts; // exits at an access that missed the fast path, all r
 static uint32_t g_invalidations; // translations dropped by code writes, all runs
 static double g_compile_ms; // translation + synchronous compile + instantiate, all runs
 static double g_translate_ms, g_first_call_ms, g_second_call_ms; // the split (Phase 0)
+static uint32_t g_calls; // calls from the C dispatcher into translations, all runs
+
+typedef int32_t (*page_fn)(ppc_t *c, int32_t budget, int32_t entry);
+typedef int32_t (*chain_fn)(ppc_t *c, int32_t budget, int32_t entry, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+
+// Call a translation: a chained one takes the registers as arguments
+static int32_t call_fn(uint32_t fn, bool chain, ppc_t *c, int32_t budget, int32_t entry) {
+    if (!chain)
+        return ((page_fn)(uintptr_t)fn)(c, budget, entry);
+    const uint32_t *g = c->gpr;
+    return ((chain_fn)(uintptr_t)fn)(c, budget, entry, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9],
+                                     g[10], g[11], g[12], g[13], g[14], g[15], g[16], g[17], g[18], g[19], g[20],
+                                     g[21], g[22], g[23], g[24], g[25], g[26], g[27], g[28], g[29], g[30], g[31],
+                                     c->cr, c->ctr, c->lr, c->xer_ca);
+}
+
+// Free function-table slots, reused by the next translations
+static uint32_t *g_free_slots;
+static uint32_t g_free_count, g_free_cap;
+static void release_fn(uint32_t fn) {
+    if (!fn)
+        return;
+    jit_release(fn);
+    if (g_free_count == g_free_cap) {
+        g_free_cap = g_free_cap ? 2 * g_free_cap : 256;
+        g_free_slots = realloc(g_free_slots, g_free_cap * sizeof *g_free_slots);
+    }
+    g_free_slots[g_free_count++] = fn;
+}
+static uint32_t take_slot(void) {
+    return g_free_count ? g_free_slots[--g_free_count] : 0;
+}
+
+// Translate g_unit and install it in *fn (replacing what was there)
+static void install_unit(uint32_t *fn, bool chain) {
+    g_emit_chain = chain;
+    double t0 = emscripten_get_now();
+    translate();
+    double t1 = emscripten_get_now();
+    release_fn(*fn);
+    *fn = jit_instantiate(g_buf, g_len, take_slot());
+    g_compiles++;
+    g_compile_bytes += g_len;
+    g_compile_ms += emscripten_get_now() - t0;
+    g_translate_ms += t1 - t0;
+    // First and second call with a zero budget, on a scratch state: the
+    // first block's guard leaves at once, so this times the call itself and
+    // any compilation the engine deferred to the first call.
+    static ppc_t scratch;
+    double a = emscripten_get_now();
+    call_fn(*fn, chain, &scratch, 0, 0);
+    double b = emscripten_get_now();
+    call_fn(*fn, chain, &scratch, 0, 0);
+    double d = emscripten_get_now();
+    g_first_call_ms += b - a;
+    g_second_call_ms += d - b;
+}
 
 // Translate (or retranslate) a page from its current bytes
-static uint32_t take_slot(void);
-
 static void compile_page(jit_page_t *jp, uint32_t base) {
     static uint32_t words[PAGE_INSNS];
     static uint8_t leader[PAGE_INSNS];
@@ -1105,32 +1429,19 @@ static void compile_page(jit_page_t *jp, uint32_t base) {
                 leader[(t & PAGE_MASK) >> 2] = 1;
         }
     }
-    double t0 = emscripten_get_now();
-    translate(base, words, leader, jp->blk_of);
-    double t1 = emscripten_get_now();
-    // The page function's table slot (an old translation's slot is leaked:
-    // a prototype)
-    jp->fn = jit_instantiate(g_buf, g_len, take_slot());
+    static unit_page_t u;
+    u = (unit_page_t){base, words, leader, jp->blk_of, jp->cov};
+    g_unit = &u;
+    g_unit_n = 1;
+    g_unit_pagemap = 0;
+    g_unit_bvalid = g_v->block ? jp->bvalid : NULL;
+    for (uint32_t i = 0; i < PAGE_INSNS; i++)
+        jp->cov[i] = NONE16;
+    jp->stale = 0;
+    jp->quiet = 0;
+    install_unit(&jp->fn, g_v->chain);
+    g_unit_bvalid = NULL;
     mem_env_code_mark(base >> PAGE_SHIFT); // stores into it now reach jit_code_written
-    g_compiles++;
-    g_compile_bytes += g_len;
-    g_compile_ms += emscripten_get_now() - t0;
-    g_translate_ms += t1 - t0;
-    // First and second call with a zero budget, on a scratch state: the
-    // first block's guard leaves at once, so this times the call itself and
-    // any compilation the engine deferred to the first call.
-    {
-        typedef int32_t (*fn_t)(ppc_t *, int32_t, int32_t);
-        static ppc_t scratch;
-        fn_t f = (fn_t)(uintptr_t)jp->fn;
-        double a = emscripten_get_now();
-        f(&scratch, 0, 0);
-        double b = emscripten_get_now();
-        f(&scratch, 0, 0);
-        double d = emscripten_get_now();
-        g_first_call_ms += b - a;
-        g_second_call_ms += d - b;
-    }
 }
 
 void ppc_jit_split(double *translate, double *module, double *instance, double *first_call, double *second_call) {
@@ -1141,30 +1452,278 @@ void ppc_jit_split(double *translate, double *module, double *instance, double *
     *second_call = g_second_call_ms;
 }
 
-typedef int32_t (*page_fn)(ppc_t *c, int32_t budget, int32_t entry);
+// === Regions (V_REGION, V_RBLOCK) ===
+// A region's reachable code is split into chunks of at most g_chunk_cap
+// instructions, one function each: the engine's optimizing compile grows
+// faster than linearly with a function's size (a 660 KB function took 11 s
+// in V8's TurboFan), so the cap bounds it.  A branch to a block of another
+// chunk leaves; the dispatcher enters that chunk.
+#define MAX_CHUNKS 64
+static uint16_t g_chunk_cov[REGION_MAX_PAGES][PAGE_INSNS]; // a chunk's coverage while it is translated
+uint32_t g_chunk_cap = 4096; // instructions per chunk (bench argument 7)
+typedef struct jit_chunk {
+    uint32_t fn;
+    uint32_t pagemap[REGION_MAX_PAGES]; // read by the chunk's function: its map of the page, or 0
+    uint16_t *maps[REGION_MAX_PAGES];
+    uint8_t *bvalid; // block mode: per block, 1 = valid
+} jit_chunk_t;
+typedef struct jit_region {
+    uint8_t member[REGION_MAX_PAGES]; // the page belongs to the region
+    jit_chunk_t chunk[MAX_CHUNKS];
+    uint32_t nchunks;
+    uint8_t *owner; // per region word: the chunk that translated it (0xFF: none)
+    uint32_t stale, quiet; // block mode: as jit_page_t's
+    bool built; // translated since the last membership change
+} jit_region_t;
+static jit_region_t **g_regions; // of the current variant
+static jit_region_t **g_regions_by_mode[NVARIANTS]; // each variant keeps its own regions
+static uint32_t g_nregions;
 
-// Free function-table slots, reused by the next translations
-static uint32_t *g_free_slots;
-static uint32_t g_free_count, g_free_cap;
-static void release_fn(uint32_t fn) {
-    if (!fn)
-        return;
-    jit_release(fn);
-    if (g_free_count == g_free_cap) {
-        g_free_cap = g_free_cap ? 2 * g_free_cap : 256;
-        g_free_slots = realloc(g_free_slots, g_free_cap * sizeof *g_free_slots);
+static jit_region_t *region_of(uint32_t page) {
+    if (!g_regions) {
+        g_nregions = (g_address_mask >> REGION_SHIFT) + 1;
+        g_regions = calloc(g_nregions, sizeof *g_regions);
+        g_regions_by_mode[g_v - g_variants] = g_regions;
     }
-    g_free_slots[g_free_count++] = fn;
-}
-static uint32_t take_slot(void) {
-    return g_free_count ? g_free_slots[--g_free_count] : 0;
+    uint32_t r = page >> (REGION_SHIFT - PAGE_SHIFT);
+    if (!g_regions[r]) {
+        g_regions[r] = calloc(1, sizeof(jit_region_t));
+        g_regions[r]->owner = malloc(REGION_MAX_PAGES * PAGE_INSNS);
+        memset(g_regions[r]->owner, 0xFF, REGION_MAX_PAGES * PAGE_INSNS);
+    }
+    return g_regions[r];
 }
 
-// A store into a marked page (mem_env.h): drop its translations (both
-// slow-path modes keep their own) and start its cooling.
+static void region_release(jit_region_t *R) {
+    for (uint32_t c = 0; c < R->nchunks; c++) {
+        release_fn(R->chunk[c].fn);
+        R->chunk[c].fn = 0;
+        memset(R->chunk[c].pagemap, 0, sizeof R->chunk[c].pagemap);
+    }
+    R->nchunks = 0;
+    R->built = false;
+    memset(R->owner, 0xFF, REGION_MAX_PAGES * PAGE_INSNS);
+}
+
+// The chunk function and block for an entry at region word x (page k), or false
+static bool region_entry(jit_region_t *R, uint32_t k, uint32_t idx, uint32_t *fn, int32_t *entry) {
+    uint8_t c = R->owner[k * PAGE_INSNS + idx];
+    if (c == 0xFF || c >= R->nchunks || !R->chunk[c].fn || !R->chunk[c].maps[k])
+        return false;
+    uint16_t b = R->chunk[c].maps[k][idx];
+    if (b == NONE16)
+        return false;
+    if (g_v->block && !R->chunk[c].bvalid[b])
+        return false;
+    *fn = R->chunk[c].fn;
+    *entry = b;
+    return true;
+}
+
+// Translate a region's member pages: the code reachable from the entry
+// points seen so far, in chunks.  A branch to an unreached address leaves;
+// its next entry makes it an entry point.
+static void compile_region(jit_region_t *R, uint32_t rbase) {
+    static uint32_t *words;
+    static uint8_t *leader, *reached;
+    static unit_page_t units[REGION_MAX_PAGES];
+    static uint32_t *stack, *seeds;
+    if (!words) {
+        words = malloc(REGION_MAX_PAGES * PAGE_INSNS * sizeof *words);
+        leader = malloc(REGION_MAX_PAGES * PAGE_INSNS);
+        reached = malloc(REGION_MAX_PAGES * PAGE_INSNS);
+        stack = malloc(REGION_MAX_PAGES * PAGE_INSNS * sizeof *stack);
+        seeds = malloc(REGION_MAX_PAGES * PAGE_INSNS * sizeof *seeds);
+    }
+    region_release(R);
+    uint32_t n = 0;
+    static uint32_t slot_page[REGION_MAX_PAGES]; // unit slot -> region page
+    for (uint32_t k = 0; k < REGION_PAGES; k++) {
+        g_unit_slot[k] = -1;
+        if (!R->member[k])
+            continue;
+        uint32_t base = rbase + (k << PAGE_SHIFT);
+        jit_page_t *jp = g_pages[base >> PAGE_SHIFT];
+        memcpy(jp->bytes, mem_env_ram() + base, MEM_PAGE_SIZE);
+        uint32_t *w = words + n * PAGE_INSNS;
+        for (uint32_t i = 0; i < PAGE_INSNS; i++) {
+            w[i] = LOAD_BE32(jp->bytes + 4 * i);
+            jp->cov[i] = NONE16;
+        }
+        memset(reached + n * PAGE_INSNS, 0, PAGE_INSNS);
+        g_unit_slot[k] = (int16_t)n;
+        slot_page[n] = k;
+        n++;
+    }
+    // The seeds: the entry points seen so far
+    uint32_t nseeds = 0;
+    for (uint32_t k = 0; k < REGION_PAGES; k++) {
+        if (g_unit_slot[k] < 0)
+            continue;
+        jit_page_t *jp = g_pages[(rbase >> PAGE_SHIFT) + k];
+        for (uint32_t i = 0; i < PAGE_INSNS; i++)
+            if (jp->extra[i])
+                seeds[nseeds++] = (uint32_t)g_unit_slot[k] * PAGE_INSNS + i;
+    }
+    // Reachability from the seeds over the direct control flow; every
+    // branch target, fall-through and entry point leads a block
+    memset(leader, 0, n * PAGE_INSNS);
+    uint32_t sp = 0;
+#define PUSH(addr)                                                                                                     \
+    do {                                                                                                               \
+        uint32_t a_ = (addr), o_ = a_ - rbase;                                                                         \
+        if (!(a_ & 3) && o_ < REGION_BYTES && g_unit_slot[o_ >> PAGE_SHIFT] >= 0) {                                    \
+            uint32_t x_ = (uint32_t)g_unit_slot[o_ >> PAGE_SHIFT] * PAGE_INSNS + ((o_ & PAGE_MASK) >> 2);             \
+            leader[x_] = 1;                                                                                            \
+            if (!reached[x_])                                                                                          \
+                stack[sp++] = x_;                                                                                      \
+        }                                                                                                              \
+    } while (0)
+    for (uint32_t si = 0; si < nseeds; si++) {
+        leader[seeds[si]] = 1;
+        stack[sp++] = seeds[si];
+    }
+    while (sp) {
+        uint32_t x = stack[--sp];
+        uint32_t slot = x / PAGE_INSNS, i = x % PAGE_INSNS;
+        uint32_t base = rbase + (slot_page[slot] << PAGE_SHIFT);
+        for (; i < PAGE_INSNS; i++) {
+            uint32_t xi = slot * PAGE_INSNS + i;
+            if (reached[xi])
+                break;
+            reached[xi] = 1;
+            uint32_t w = words[xi];
+            if (!translatable(w)) {
+                leader[xi] = 1; // a block that leaves
+                break;
+            }
+            if (is_branch(w)) {
+                uint32_t a = base + 4 * i, t = direct_target(a, w), o = w >> 26;
+                if (t != ~0u)
+                    PUSH(t);
+                bool always = (o == 18) || ((o == 16 || o == 19) && (P_RD(w) & 0x14) == 0x14);
+                if (!always || (w & 1)) // falls through, or a call that returns here
+                    PUSH(a + 4);
+                break;
+            }
+        }
+        if (i == PAGE_INSNS)
+            PUSH(base + MEM_PAGE_SIZE); // ran off the page
+    }
+#undef PUSH
+    // Chunks: whole blocks, in address order, up to the cap each.  A branch
+    // to a block of another chunk leaves to it: the target leads a block
+    // there too, so the partition does not depend on which entry came first.
+    uint32_t c = 0, count = 0;
+    bool any = false;
+    for (uint32_t s = 0; s < n; s++)
+        for (uint32_t i = 0; i < PAGE_INSNS; i++) {
+            uint32_t x = s * PAGE_INSNS + i;
+            if (!reached[x])
+                continue;
+            if (leader[x] && count >= g_chunk_cap && c + 1 < MAX_CHUNKS) {
+                c++;
+                count = 0;
+            }
+            R->owner[slot_page[s] * PAGE_INSNS + i] = (uint8_t)c;
+            count++;
+            any = true;
+        }
+    R->nchunks = any ? c + 1 : 0;
+    static uint8_t *chunk_leader;
+    if (!chunk_leader)
+        chunk_leader = malloc(REGION_MAX_PAGES * PAGE_INSNS);
+    for (uint32_t ci = 0; ci < R->nchunks; ci++) {
+        jit_chunk_t *ch = &R->chunk[ci];
+        for (uint32_t s2 = 0; s2 < n; s2++) {
+            uint32_t k = slot_page[s2];
+            for (uint32_t i = 0; i < PAGE_INSNS; i++)
+                chunk_leader[s2 * PAGE_INSNS + i] =
+                    leader[s2 * PAGE_INSNS + i] && reached[s2 * PAGE_INSNS + i] && R->owner[k * PAGE_INSNS + i] == ci;
+            if (!ch->maps[k])
+                ch->maps[k] = malloc(PAGE_INSNS * sizeof(uint16_t));
+            jit_page_t *jp = g_pages[(rbase >> PAGE_SHIFT) + k];
+            units[s2] = (unit_page_t){rbase + (k << PAGE_SHIFT), words + s2 * PAGE_INSNS,
+                                      chunk_leader + s2 * PAGE_INSNS, ch->maps[k],
+                                      g_v->block ? g_chunk_cov[s2] : jp->cov};
+        }
+        g_unit = units;
+        g_unit_n = n;
+        g_unit_rbase = rbase;
+        g_unit_pagemap = fp(ch->pagemap);
+        if (g_v->block) {
+            if (!ch->bvalid)
+                ch->bvalid = malloc(REGION_MAX_PAGES * PAGE_INSNS);
+            g_unit_bvalid = ch->bvalid;
+            for (uint32_t s2 = 0; s2 < n; s2++)
+                for (uint32_t i = 0; i < PAGE_INSNS; i++)
+                    g_chunk_cov[s2][i] = NONE16;
+        }
+        install_unit(&ch->fn, false);
+        g_unit_bvalid = NULL;
+        g_unit_pagemap = 0;
+        for (uint32_t s2 = 0; s2 < n; s2++) {
+            uint32_t k = slot_page[s2];
+            ch->pagemap[k] = fp(ch->maps[k]);
+            if (g_v->block) { // the page's coverage: this chunk's words
+                jit_page_t *jp = g_pages[(rbase >> PAGE_SHIFT) + k];
+                for (uint32_t i = 0; i < PAGE_INSNS; i++)
+                    if (g_chunk_cov[s2][i] != NONE16)
+                        jp->cov[i] = g_chunk_cov[s2][i];
+            }
+        }
+    }
+    R->stale = 0;
+    R->quiet = 0;
+    R->built = true;
+    for (uint32_t s = 0; s < n; s++)
+        mem_env_code_mark((rbase >> PAGE_SHIFT) + slot_page[s]);
+}
+
+// A store into a marked page (mem_env.h): drop the translations that cover
+// it (every variant keeps its own) and start the page's cooling.  In the
+// region variant the page leaves its region for good: it runs as a page
+// function from now on.
+static uint32_t g_block_invals; // blocks invalidated (block mode), all runs
+
 static void jit_code_written(uint32_t page) {
     g_code_epoch++;
-    for (int m = 0; m < 2; m++) {
+    if (g_v->block) {
+        // Only the blocks covering the written words; the translation stays
+        // (and the page its mark: further stores still report here)
+        jit_page_t *jp = g_pages[page];
+        jit_region_t *R = NULL;
+        uint32_t k = page & (REGION_PAGES - 1);
+        if (g_v->region && g_regions) {
+            R = g_regions[page >> (REGION_SHIFT - PAGE_SHIFT)];
+            if (!(R && R->built && R->member[k]))
+                R = NULL;
+        }
+        if (!jp || (!jp->fn && !R))
+            goto others;
+        uint32_t *stale = R ? &R->stale : &jp->stale, *quiet = R ? &R->quiet : &jp->quiet;
+        uint32_t a0 = g_code_write_addr < (page << PAGE_SHIFT) ? page << PAGE_SHIFT : g_code_write_addr;
+        uint32_t a1 = g_code_write_addr + g_code_write_size - 1;
+        if ((a1 >> PAGE_SHIFT) != page)
+            a1 = (page << PAGE_SHIFT) | PAGE_MASK;
+        for (uint32_t w = (a0 & PAGE_MASK) >> 2; w <= (a1 & PAGE_MASK) >> 2; w++) {
+            uint16_t b = jp->cov[w];
+            uint8_t *bvalid = jp->bvalid;
+            if (R) { // the chunk that translated the word
+                uint8_t c = R->owner[k * PAGE_INSNS + w];
+                bvalid = c < R->nchunks ? R->chunk[c].bvalid : NULL;
+            }
+            if (b != NONE16 && bvalid && bvalid[b]) {
+                bvalid[b] = 0;
+                (*stale)++;
+                g_block_invals++;
+            }
+        }
+        *quiet = 0;
+        return;
+    }
+others:
+    for (int m = 0; m < NVARIANTS; m++) {
         jit_page_t *jp = g_pages_by_mode[m] ? g_pages_by_mode[m][page] : NULL;
         if (jp && jp->fn) {
             release_fn(jp->fn);
@@ -1174,72 +1733,174 @@ static void jit_code_written(uint32_t page) {
         if (jp)
             jp->cooling = JIT_COOL_ENTRIES;
     }
+    if (g_regions) {
+        jit_region_t *R = g_regions[page >> (REGION_SHIFT - PAGE_SHIFT)];
+        uint32_t k = page & (REGION_PAGES - 1);
+        if (R && R->member[k]) {
+            if (R->built)
+                g_invalidations++;
+            region_release(R);
+            R->member[k] = 0;
+        }
+        jit_page_t *jp = g_pages_by_mode[V_REGION] ? g_pages_by_mode[V_REGION][page] : NULL;
+        if (jp)
+            jp->written = 1;
+    }
     mem_env_code_unmark(page); // stores are fast again until the next translation
 }
 
-static void run_jit(ppc_t *c, uint32_t budget, int mode) {
-    g_jit_slow_mode = mode;
-    if (!g_pages_by_mode[mode]) {
-        g_npages = (g_address_mask + 1) >> PAGE_SHIFT;
-        g_pages_by_mode[mode] = calloc(g_npages, sizeof *g_pages);
+// At the start of a run: drop the translations whose bytes changed since
+// (the kernels are reassembled for every run), mark the rest's pages.
+static void revalidate(void) {
+    for (uint32_t p = 0; p < g_npages; p++) {
+        jit_page_t *jp = g_pages[p];
+        if (!jp || !jp->fn)
+            continue;
+        if (memcmp(jp->bytes, mem_env_ram() + (p << PAGE_SHIFT), MEM_PAGE_SIZE) != 0) {
+            release_fn(jp->fn);
+            jp->fn = 0;
+            memset(jp->extra, 0, sizeof jp->extra);
+        } else {
+            mem_env_code_mark(p);
+        }
     }
-    g_pages = g_pages_by_mode[mode];
+    if (!g_v->region || !g_regions)
+        return;
+    for (uint32_t r = 0; r < g_nregions; r++) {
+        jit_region_t *R = g_regions[r];
+        if (!R || !R->built)
+            continue;
+        uint32_t p0 = r << (REGION_SHIFT - PAGE_SHIFT);
+        bool ok = true;
+        for (uint32_t k = 0; k < REGION_PAGES && ok; k++)
+            if (R->member[k])
+                ok = memcmp(g_pages[p0 + k]->bytes, mem_env_ram() + ((p0 + k) << PAGE_SHIFT), MEM_PAGE_SIZE) == 0;
+        if (!ok) {
+            region_release(R);
+            continue;
+        }
+        for (uint32_t k = 0; k < REGION_PAGES; k++)
+            if (R->member[k])
+                mem_env_code_mark(p0 + k);
+    }
+}
+
+static void run_jit(ppc_t *c, uint32_t budget, int variant) {
+
+    g_v = &g_variants[variant];
+    g_jit_slow_mode = g_v->slow;
+    if (!g_pages_by_mode[variant]) {
+        g_npages = (g_address_mask + 1) >> PAGE_SHIFT;
+        g_pages_by_mode[variant] = calloc(g_npages, sizeof *g_pages);
+    }
+    g_pages = g_pages_by_mode[variant];
+    g_regions = g_regions_by_mode[variant];
     g_code_write_hook = jit_code_written;
     g_chaos_state = g_jit_chaos_seed;
-    g_gen++; // a new run: every page revalidates on first entry
+    revalidate();
     uint32_t n = budget;
     while (n > 0) {
         uint32_t pc = c->pc & g_address_mask;
         uint32_t page = pc >> PAGE_SHIFT, base = pc & ~(uint32_t)PAGE_MASK;
+        uint32_t idx = (pc & PAGE_MASK) >> 2;
+        if (pc & 3) { // never in the kernels: let the interpreter decide
+            ppc_run_switch(c, 1);
+            n--;
+            continue;
+        }
         jit_page_t *jp = g_pages[page];
         if (!jp) {
             jp = calloc(1, sizeof *jp);
             g_pages[page] = jp;
         }
-        if (jp->gen != g_gen) {
-            jp->gen = g_gen;
-            if (jp->fn && memcmp(jp->bytes, mem_env_ram() + base, MEM_PAGE_SIZE) != 0) {
-                release_fn(jp->fn);
-                jp->fn = 0;
-                memset(jp->extra, 0, sizeof jp->extra);
+        // The translation for this entry, if there is one
+        jit_region_t *R = NULL;
+        uint32_t k = page & (REGION_PAGES - 1);
+        uint32_t fn = 0;
+        int32_t entry = 0;
+        bool chain = false;
+        if (g_v->region && !jp->written) {
+            R = region_of(page);
+            if (g_v->block && R->stale && ++R->quiet >= JIT_COOL_ENTRIES && R->built)
+                compile_region(R, base - (k << PAGE_SHIFT)); // quiet again: retranslate
+            if (R->built && R->member[k] && !region_entry(R, k, idx, &fn, &entry)) {
+                uint8_t ch = R->owner[k * PAGE_INSNS + idx];
+                if (g_v->block && ch < R->nchunks && R->chunk[ch].maps[k] &&
+                    R->chunk[ch].maps[k][idx] != NONE16) {
+                    // An invalidated block: the interpreter runs a slice
+                    uint32_t s = n < JIT_COOL_SLICE ? n : JIT_COOL_SLICE;
+                    ppc_run_switch(c, s);
+                    n -= s;
+                    continue;
+                }
+                fn = 0;
             }
-            if (jp->fn)
-                mem_env_code_mark(page); // the marks do not outlive a run (below)
+        } else if (jp->fn && jp->blk_of[idx] != NONE16) {
+            fn = jp->fn;
+            entry = jp->blk_of[idx];
+            chain = g_v->chain;
+            if (g_v->block && jp->stale) {
+                if (++jp->quiet >= JIT_COOL_ENTRIES) {
+                    compile_page(jp, base); // quiet again: retranslate the page
+                    fn = jp->fn;
+                    entry = jp->blk_of[idx];
+                } else if (!jp->bvalid[entry]) {
+                    // An invalidated block: the interpreter runs a slice
+                    uint32_t s = n < JIT_COOL_SLICE ? n : JIT_COOL_SLICE;
+                    ppc_run_switch(c, s);
+                    n -= s;
+                    continue;
+                }
+            }
         }
-        if (!jp->fn && !jp->cooling && g_jit_chaos_seed) {
-            if (!jp->pending) {
-                g_chaos_state = g_chaos_state * 1664525u + 1013904223u;
-                jp->pending = 1 + ((g_chaos_state >> 16) & 63);
-            }
-            if (--jp->pending) {
-                uint32_t k = n < JIT_COOL_SLICE ? n : JIT_COOL_SLICE;
-                ppc_run_switch(c, k);
-                n -= k;
+        if (!fn) {
+            if (jp->cooling) {
+                // Recently written: interpret a slice, count the entry
+                uint32_t s = n < JIT_COOL_SLICE ? n : JIT_COOL_SLICE;
+                ppc_run_switch(c, s);
+                n -= s;
+                jp->cooling--;
                 continue;
             }
-            // the translation "arrives" now: compiled below
-        }
-        if (!jp->fn && jp->cooling) {
-            // Recently written: interpret a slice, count the entry
-            uint32_t k = n < JIT_COOL_SLICE ? n : JIT_COOL_SLICE;
-            ppc_run_switch(c, k);
-            n -= k;
-            jp->cooling--;
-            continue;
-        }
-        uint32_t idx = (pc & PAGE_MASK) >> 2;
-        if (!jp->fn || (pc & 3) || jp->blk_of[idx] == NONE16) {
-            if (pc & 3) { // never in the kernels: let the interpreter decide
-                ppc_run_switch(c, 1);
-                n--;
-                continue;
+            if (g_jit_chaos_seed) {
+                if (!jp->pending) {
+                    g_chaos_state = g_chaos_state * 1664525u + 1013904223u;
+                    jp->pending = 1 + ((g_chaos_state >> 16) & 63);
+                }
+                if (--jp->pending) {
+                    uint32_t s = n < JIT_COOL_SLICE ? n : JIT_COOL_SLICE;
+                    ppc_run_switch(c, s);
+                    n -= s;
+                    continue;
+                }
+                // the translation "arrives" now: compiled below
             }
             jp->extra[idx] = 1; // a run-time entry point: make it a leader
-            compile_page(jp, base);
+            if (R) {
+                R->member[k] = 1;
+                compile_region(R, base - (k << PAGE_SHIFT));
+                if (!region_entry(R, k, idx, &fn, &entry)) {
+                    // (only when the chunks ran out: the interpreter runs a slice)
+                    uint32_t s = n < JIT_COOL_SLICE ? n : JIT_COOL_SLICE;
+                    ppc_run_switch(c, s);
+                    n -= s;
+                    continue;
+                }
+            } else {
+                compile_page(jp, base);
+                fn = jp->fn;
+                entry = jp->blk_of[idx];
+                chain = g_v->chain;
+            }
         }
         g_jit_reason = JIT_EXIT_PC;
-        int32_t left = ((page_fn)(uintptr_t)jp->fn)(c, (int32_t)n, (int32_t)jp->blk_of[idx]);
-        uint32_t rem = (uint32_t)left;
+        g_calls++;
+        // A sprint-sized call (g_jit_sprint, 0: the whole budget), as an
+        // emulator's scheduler would make it: the engine switches to
+        // optimized code for a function at its next call, never inside one
+        uint32_t give = (g_jit_sprint && n > g_jit_sprint) ? g_jit_sprint : n;
+        int32_t left = call_fn(fn, chain, c, (int32_t)give, entry);
+        uint32_t rem = (uint32_t)left + (n - give);
         if (g_jit_reason == JIT_EXIT_DEOPT) {
             // The instruction at c->pc missed the fast path: the interpreter
             // runs it, with the state committed up to it.
@@ -1250,10 +1911,11 @@ static void run_jit(ppc_t *c, uint32_t budget, int mode) {
         }
         if (rem == n) {
             // No progress: the entry block is longer than the budget left
-            // (the run's tail), or the instruction there is untranslatable.
-            // The interpreter finishes the run exactly.
-            ppc_run_switch(c, rem);
-            rem = 0;
+            // (the run's tail), the instruction there is untranslatable, or
+            // the block was invalidated.  The interpreter runs a slice.
+            uint32_t s = rem < JIT_COOL_SLICE ? rem : JIT_COOL_SLICE;
+            ppc_run_switch(c, s);
+            rem -= s;
         }
         n = rem;
     }
@@ -1264,11 +1926,30 @@ static void run_jit(ppc_t *c, uint32_t budget, int mode) {
 
 // Backend G: misses of the memory fast path leave the translation
 void ppc_run_jit(ppc_t *c, uint32_t budget) {
-    run_jit(c, budget, JIT_SLOW_DEOPT);
+    run_jit(c, budget, V_PAGE);
 }
 // Backend G': misses write the registers back and call the C slow path
 void ppc_run_jit_call(ppc_t *c, uint32_t budget) {
-    run_jit(c, budget, JIT_SLOW_CALL);
+    run_jit(c, budget, V_CALL);
+}
+// Phase A2 variants (deopt slow paths)
+void ppc_run_jit_chain(ppc_t *c, uint32_t budget) {
+    run_jit(c, budget, V_CHAIN);
+}
+void ppc_run_jit_region(ppc_t *c, uint32_t budget) {
+    run_jit(c, budget, V_REGION);
+}
+void ppc_run_jit_lazy(ppc_t *c, uint32_t budget) {
+    run_jit(c, budget, V_LAZY);
+}
+void ppc_run_jit_block(ppc_t *c, uint32_t budget) {
+    run_jit(c, budget, V_BLOCK);
+}
+void ppc_run_jit_rblock(ppc_t *c, uint32_t budget) {
+    run_jit(c, budget, V_RBLOCK);
+}
+uint32_t ppc_jit_block_invals(void) {
+    return g_block_invals;
 }
 
 uint32_t ppc_jit_compiles(void) {
@@ -1280,16 +1961,29 @@ uint32_t ppc_jit_compile_bytes(void) {
 uint32_t ppc_jit_deopts(void) {
     return g_deopts;
 }
+uint32_t ppc_jit_calls(void) {
+    return g_calls;
+}
 void ppc_jit_reset(void) {
-    for (int m = 0; m < 2; m++)
+    for (int m = 0; m < NVARIANTS; m++)
         if (g_pages_by_mode[m])
             for (uint32_t i = 0; i < g_npages; i++)
                 if (g_pages_by_mode[m][i]) {
-                    release_fn(g_pages_by_mode[m][i]->fn);
-                    g_pages_by_mode[m][i]->fn = 0;
-                    g_pages_by_mode[m][i]->cooling = 0;
-                    g_pages_by_mode[m][i]->pending = 0;
+                    jit_page_t *jp = g_pages_by_mode[m][i];
+                    release_fn(jp->fn);
+                    jp->fn = 0;
+                    jp->cooling = 0;
+                    jp->pending = 0;
+                    jp->written = 0;
+                    memset(jp->extra, 0, sizeof jp->extra);
                 }
+    for (int m = 0; m < NVARIANTS; m++)
+        for (uint32_t r = 0; g_regions_by_mode[m] && r < g_nregions; r++)
+            if (g_regions_by_mode[m][r]) {
+                jit_region_t *R = g_regions_by_mode[m][r];
+                region_release(R);
+                memset(R->member, 0, sizeof R->member);
+        }
 }
 uint32_t ppc_jit_invalidations(void) {
     return g_invalidations;

@@ -38,5 +38,6 @@ void mem_env_code_unmark(uint32_t page);
 void mem_env_code_unmark_all(void);
 bool mem_env_code_marked(uint32_t page);
 extern void (*g_code_write_hook)(uint32_t page);
+extern uint32_t g_code_write_addr, g_code_write_size; // the store being reported (for the hook)
 
 #endif // MEM_ENV_H

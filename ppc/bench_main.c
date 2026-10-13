@@ -67,6 +67,7 @@ void ppc_illegal(ppc_t *c, uint32_t insn) {
 #define E_B(off)          (((uint32_t)18 << 26) | ((uint32_t)(off) & 0x03FFFFFCu))
 #define E_BL(off)         (E_B(off) | 1u)
 #define E_BLR             0x4E800020u
+#define E_BCTR            0x4E800420u
 
 static uint32_t g_emit_pc; // guest address the next emit() lands at
 
@@ -310,6 +311,131 @@ static void emit_kernel_smc(void) {
     emit(E_B((int32_t)(outer - g_emit_pc)));
 }
 
+#define EMU_TABLE    0x030000u // emu68k: 64 dispatch entries, one `b handler` each
+#define EMU_HANDLERS 0x031000u // ... 64 handlers spread over 12 pages
+#define EMU_FETCH    0x03D000u // ... the shared fetch-and-dispatch routine
+#define EMU_STREAM   0x040000u // ... the "68K program": 16-bit opcodes
+#define EMU_DATA     0x050000u // ... the 68K data the handlers load and store
+#define EMU_NH       64
+#define EMU_PAGES    12
+#define EMU_STREAM_LEN 32768
+
+// Kernel 6: emu68k — an interpretive emulator, shaped like the one the
+// 601's ROM runs 68K code with: fetch an opcode, index a dispatch table of
+// one-instruction entries (`b handler`), run a short handler (0-3
+// instructions) in one of 12 handler pages, branch back to the shared
+// fetch.  About 3.5 instructions per page visit, every visit ending in a
+// branch to another page, as the profile of the pm6100 desktop found (3.4).
+// The 68K data registers are r8..r15; r20 is the 68K pc, r21 the table,
+// r22 the 68K data, r23 the program's start.
+static void emu_handler_body(int k) {
+    int a = 8 + ((k >> 1) & 7), b = 8 + ((k >> 3) & 7);
+    uint32_t off = (uint32_t)(k * 4) & 0xFFC;
+    if (k == EMU_NH - 1) { // the last opcode: back to the program's start
+        emit(E_OR(20, 23, 23));
+        return;
+    }
+    switch (k % 8) {
+    case 0: emit(E_ADD(a, a, b)); break;
+    case 1: emit(E_XOR(a, a, b)); emit(E_RLWINM(a, a, 1, 0, 31)); break;
+    case 2: emit(E_ADDI(a, a, k)); break;
+    case 3: emit(E_LWZ(4, 22, off)); emit(E_ADD(a, a, 4)); break;
+    case 4: emit(E_STW(a, 22, off)); break;
+    case 5: // a compare and a conditional skip inside the handler
+        emit(E_CMPWI(0, a, 0));
+        emit(E_BC(12, 0, 8)); // blt: skip the subf
+        emit(E_SUBF(a, b, a));
+        break;
+    case 6: emit(E_OR(a, a, b)); emit(E_ANDI_RC(b, a, 0x7FFF)); break;
+    default: emit(E_STH(a, 22, off + 2)); emit(E_ADDI(b, b, 1)); break;
+    }
+}
+
+static void emit_kernel_emu68k(void) {
+    // The program: random opcodes, the last one restarts it
+    uint32_t seed = 0x68000001u;
+    for (int i = 0; i < EMU_STREAM_LEN; i++) {
+        uint32_t op = (i == EMU_STREAM_LEN - 1) ? (uint32_t)(EMU_NH - 1) << 10
+                                                : ((lcg(&seed) >> 8) % (EMU_NH - 1)) << 10 | (i & 0x3FF);
+        STORE_BE16(g_ram + EMU_STREAM + 2u * (uint32_t)i, (uint16_t)op);
+    }
+    uint32_t save = g_emit_pc;
+    // The shared fetch and dispatch
+    g_emit_pc = EMU_FETCH;
+    emit(E_LHZ(3, 20, 0));
+    emit(E_ADDI(20, 20, 2));
+    emit(E_RLWINM(4, 3, 24, 24, 29)); // (opcode >> 10) * 4
+    emit(E_ADD(4, 4, 21));
+    emit(E_MTCTR(4));
+    emit(E_BCTR);
+    // The handlers and the table
+    for (int k = 0; k < EMU_NH; k++) {
+        uint32_t h = EMU_HANDLERS + (uint32_t)(k % EMU_PAGES) * 0x1000u + (uint32_t)(k / EMU_PAGES) * 0x40u;
+        g_emit_pc = h;
+        emu_handler_body(k);
+        emit(E_B((int32_t)(EMU_FETCH - g_emit_pc)));
+        g_emit_pc = EMU_TABLE + 4u * (uint32_t)k;
+        emit(E_B((int32_t)(h - g_emit_pc)));
+    }
+    g_emit_pc = save;
+    // Start-up: the bases, the data registers, then into the fetch
+    emit(E_ADDIS(20, 0, EMU_STREAM >> 16));
+    emit(E_ADDIS(23, 0, EMU_STREAM >> 16));
+    emit(E_ADDIS(21, 0, EMU_TABLE >> 16));
+    emit(E_ADDIS(22, 0, EMU_DATA >> 16));
+    for (int r = 8; r <= 15; r++)
+        emit(E_ADDI(r, 0, r * 7));
+    emit(E_B((int32_t)(EMU_FETCH - g_emit_pc)));
+}
+
+#define DRC_BASE 0x060000u // dr-patch: the "translation cache" page
+
+// Kernel 7: dr-patch — a code page used the way the pm8500's DR emulator
+// uses its translation cache (the page-heat profile, 2026-10-12): eight
+// routines in one page, six of them called per round (~85 instructions).
+// Each round stores into the data word after a routine's blr, as a
+// translator keeps link fields beside its code; every 128th round also
+// rewrites one word of code (an addi immediate, as a translator patches its
+// output).  On the pm8500's hottest cache pages a store lands next to code
+// every ~70 instructions, and one rewrites code every ~10 K.
+static void emit_kernel_drpatch(void) {
+    uint32_t save = g_emit_pc;
+    for (int j = 0; j < 8; j++) {
+        g_emit_pc = DRC_BASE + 64u * (uint32_t)j;
+        emit(E_ADDI(5, 5, j + 1)); // the patched word
+        emit(E_RLWINM(6, 5, 3, 0, 31));
+        emit(E_ADD(9, 9, 6));
+        emit(E_LWZ(7, 21, 4 * j));
+        emit(E_XOR(5, 5, 7));
+        emit(E_ADDI(9, 9, 7));
+        emit(E_RLWINM(6, 9, 5, 0, 31));
+        emit(E_ADD(5, 5, 6));
+        emit(E_CMPWI(0, 5, 0));
+        emit(E_BC(12, 0, 8)); // blt: skip the subf
+        emit(E_SUBF(9, 5, 9));
+        emit(E_XOR(9, 9, 5));
+        emit(E_BLR);
+        // words 13..15: data (word 15 is the link field the driver writes)
+    }
+    g_emit_pc = save;
+    emit(E_ADDIS(21, 0, DATA_BASE >> 16));
+    emit(E_ADDIS(22, 0, DRC_BASE >> 16));
+    emit(E_ADDI(23, 0, 0));
+    uint32_t loop = g_emit_pc;
+    for (int j = 0; j < 6; j++)
+        emit(E_BL((int32_t)(DRC_BASE + 64u * (uint32_t)j - g_emit_pc)));
+    emit(E_RLWINM(24, 23, 6, 23, 25)); // (round & 7) * 64
+    emit(E_ADD(24, 24, 22));
+    emit(E_ANDI_RC(25, 23, 127));
+    emit(E_BC(4, 2, 16)); // bne cr0: no patch this round
+    emit(E_LWZ(8, 24, 0)); // patch the routine's first word
+    emit(E_XORI(8, 8, 1));
+    emit(E_STW(8, 24, 0));
+    emit(E_STW(23, 24, 60)); // its link field
+    emit(E_ADDI(23, 23, 1));
+    emit(E_B((int32_t)(loop - g_emit_pc)));
+}
+
 // Reset guest RAM + CPU state and assemble kernel `k`; both backends must
 // start every run from this exact state
 static void setup_kernel(int k, ppc_t *c) {
@@ -328,8 +454,12 @@ static void setup_kernel(int k, ppc_t *c) {
         emit_kernel_stress();
     else if (k == 3)
         emit_kernel_io();
-    else
+    else if (k == 4)
         emit_kernel_smc();
+    else if (k == 5)
+        emit_kernel_emu68k();
+    else
+        emit_kernel_drpatch();
     mem_env_device_reset();
     memset(c, 0, sizeof(*c));
     c->pc = CODE_BASE;
@@ -370,32 +500,40 @@ static double now_ms(void) {
 
 typedef void run_fn(ppc_t *c, uint32_t budget);
 #ifdef __EMSCRIPTEN__
-#define NBACKENDS 8 // + G, G': the wasm JIT (runtime code generation needs a wasm host)
+#define NBACKENDS 13 // + G, G' and the A2 variants: the wasm JIT (runtime code generation needs a wasm host)
 #else
 #define NBACKENDS 6
 #endif
 static run_fn *const g_backends[NBACKENDS] = { ppc_run_switch, ppc_run_tail, ppc_run_call,
                                                ppc_run_pd, ppc_run_pdx8, ppc_run_pdx16
 #ifdef __EMSCRIPTEN__
-                                               , ppc_run_jit, ppc_run_jit_call
+                                               , ppc_run_jit, ppc_run_jit_call, ppc_run_jit_chain,
+                                               ppc_run_jit_region, ppc_run_jit_lazy, ppc_run_jit_block,
+                                               ppc_run_jit_rblock
 #endif
 };
 static const char *const g_backend_names[NBACKENDS] = { "switch", "tail-call", "call-loop",
                                                         "pd-raw", "pdx-8B", "pdx-16B"
 #ifdef __EMSCRIPTEN__
-                                                        , "wasm-jit", "jit-call"
+                                                        , "wasm-jit", "jit-call", "jit-chain",
+                                                        "jit-region", "jit-lazy", "jit-blockinv",
+                                                        "jit-rgn-blk"
 #endif
 };
-#define NKERNELS 5
+#define NKERNELS 7
 static const char *const g_kernel_names[NKERNELS] = { "alu-loop", "mem-stream", "dispatch-stress", "io-mixed",
-                                                      "smc-burst" };
-#define K_SMC 4
+                                                      "smc-burst", "emu68k", "dr-patch" };
+#define K_SMC     4
+#define K_DRPATCH 6
 
 // Backends that see code writes: the ones that fetch through memory, and
 // the JIT (code-page marks).  The predecode backends decode their region
 // once per run and are not run on smc-burst.
+static uint32_t g_bmask = ~0u;
 static bool runs_on(int b, int k) {
-    if (k != K_SMC)
+    if (!(g_bmask & (1u << b)))
+        return false;
+    if (k != K_SMC && k != K_DRPATCH)
         return true;
     return b <= 2 || b >= 6; // switch, tail-call, call-loop, wasm-jit, jit-call
 }
@@ -430,6 +568,18 @@ int main(int argc, char **argv) {
         bench_budget = (uint32_t)strtoul(argv[1], NULL, 0);
     if (argc > 2)
         reps = atoi(argv[2]);
+    // Optional filters (debugging): bit masks of the kernels and backends to run
+    uint32_t kmask = argc > 3 ? (uint32_t)strtoul(argv[3], NULL, 0) : ~0u;
+    if (argc > 4)
+        g_bmask = (uint32_t)strtoul(argv[4], NULL, 0) | 1u; // the switch interpreter is the reference
+#ifdef __EMSCRIPTEN__
+    if (argc > 5) // sprint-sized calls into translations, as an emulator's scheduler makes them
+        g_jit_sprint = (uint32_t)strtoul(argv[5], NULL, 0);
+    if (argc > 6) // the region size, log2 bytes (12..20)
+        g_region_shift = (uint32_t)strtoul(argv[6], NULL, 0);
+    if (argc > 7) // the most instructions one region chunk (one function) translates
+        g_chunk_cap = (uint32_t)strtoul(argv[7], NULL, 0);
+#endif
 
     mem_env_init(RAM_SIZE);
     mem_env_device(DEVICE_BASE, DEVICE_BYTES);
@@ -447,6 +597,8 @@ int main(int argc, char **argv) {
     ppc_t cpu;
     g_cur_cpu = &cpu;
     for (int k = 0; k < NKERNELS; k++) {
+        if (!(kmask & (1u << k)))
+            continue;
         // 1. correctness: both backends must produce bit-identical state
         uint64_t hash[NBACKENDS];
         for (int b = 0; b < NBACKENDS; b++) {
@@ -467,7 +619,9 @@ int main(int argc, char **argv) {
         // 1b. chaos: translations "arrive" after random delays (an
         // asynchronous pipeline's timing); the state must not move
         for (uint32_t seed = 1; seed <= 4; seed++) {
-            for (int b = 6; b <= 7; b++) {
+            for (int b = 6; b < NBACKENDS; b++) {
+                if (!runs_on(b, k))
+                    continue;
                 ppc_jit_reset();
                 g_jit_chaos_seed = seed * 2654435761u;
                 setup_kernel(k, &cpu);
@@ -509,6 +663,8 @@ int main(int argc, char **argv) {
         for (int b = 0; b < NBACKENDS; b++)
             mips[b] = (double)bench_budget / 1e3 / best[b];
         for (int b = 0; b < NBACKENDS; b++) {
+            if (!(g_bmask & (1u << b)))
+                continue;
             if (!runs_on(b, k)) {
                 printf("%-16s %-10s      n/a  (decodes once per run: not coherent with code writes)\n",
                        g_kernel_names[k], g_backend_names[b]);
@@ -534,8 +690,10 @@ int main(int argc, char **argv) {
         double tr, mo, in, f1, f2;
         ppc_jit_split(&tr, &mo, &in, &f1, &f2);
         unsigned n = ppc_jit_compiles();
-        printf("wasm-jit: %u exits to the interpreter at a slow-path access; %u translations dropped by code writes\n",
-               ppc_jit_deopts(), ppc_jit_invalidations());
+        printf("wasm-jit: %u exits to the interpreter at a slow-path access; %u translations dropped by code writes; "
+               "%u calls from the dispatcher\n",
+               ppc_jit_deopts(), ppc_jit_invalidations(), ppc_jit_calls());
+        printf("wasm-jit: %u blocks invalidated (block-granular variant)\n", ppc_jit_block_invals());
         printf("wasm-jit split per page: translate %.3f ms, Module (sync compile) %.3f ms, Instance %.3f ms, "
                "first call %.3f ms, second call %.4f ms\n",
                tr / n, mo / n, in / n, f1 / n, f2 / n);

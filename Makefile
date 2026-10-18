@@ -3,13 +3,13 @@
 # -mtail-call is required for the return_call_indirect backend.
 
 CFLAGS   := -O2 -DNDEBUG -Wall -Icommon $(BENCH_DEFS)
-EMFLAGS  := -mtail-call -Wno-initializer-overrides
+EMFLAGS  := -mtail-call -Wno-initializer-overrides -sALLOW_TABLE_GROWTH
 BUILD    := build
 
 COMMON_SRCS := common/mem_env.c
 M68K_SRCS := m68k/bench_main.c m68k/m68k_switch.c m68k/m68k_pd.c m68k/m68k_pd_elide.c $(COMMON_SRCS)
 M68K_HDRS := m68k/m68k_bench.h m68k/m68k_ops.h m68k/m68k_pd_impl.h common/mem_fastpath.h common/mem_env.h
-PPC_SRCS := ppc/bench_main.c ppc/ppc_switch.c ppc/ppc_tail.c ppc/ppc_call.c ppc/ppc_predecode.c ppc/ppc_pdx8.c ppc/ppc_pdx16.c $(COMMON_SRCS)
+PPC_SRCS := ppc/bench_main.c ppc/ppc_switch.c ppc/ppc_tail.c ppc/ppc_call.c ppc/ppc_predecode.c ppc/ppc_pdx8.c ppc/ppc_pdx16.c ppc/ppc_jit.c $(COMMON_SRCS)
 PPC_HDRS := ppc/ppc_bench.h ppc/ppc_ops.h common/mem_fastpath.h common/mem_env.h
 
 all: $(BUILD)/ppc-bench-native $(BUILD)/ppc-bench.js $(BUILD)/ppc-bench-web.html $(BUILD)/m68k-bench-native $(BUILD)/m68k-bench.js $(BUILD)/be-micro-native $(BUILD)/be-micro.js

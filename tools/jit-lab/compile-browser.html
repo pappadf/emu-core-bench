@@ -1,0 +1,26 @@
+<!-- SPDX-License-Identifier: MIT -->
+<!-- compile-browser.html: compile-node.mjs's async/worker/worker-warm modes in a browser page; modules in ./dump/ (see run-browser.mjs) -->
+<!doctype html><meta charset=utf-8><body><script type=module>
+const files = Array.from({length: 20}, (_, i) => `dump/page${i}.wasm`);
+const bufs = await Promise.all(files.map(f => fetch(f).then(r => r.arrayBuffer())));
+const mk = () => ({ e: { m: new WebAssembly.Memory({ initial: 1024 }), t: new WebAssembly.Table({ initial: 4, element: 'anyfunc' }) } });
+const workerSrc = `onmessage = async (e) => { const mod = await WebAssembly.compile(e.data.bytes);
+  if (e.data.warm) { const i = new WebAssembly.Instance(mod, { e: { m: new WebAssembly.Memory({ initial: 1024 }), t: new WebAssembly.Table({ initial: 4, element: 'anyfunc' }) } }); i.exports.f(0,0,0); }
+  postMessage(mod); };`;
+const wurl = URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }));
+for (const mode of ['async', 'worker', 'worker-warm']) {
+  const tot = { get: 0, inst: 0, first: 0, second: 0 };
+  for (const b of bufs) {
+    let mod, blocked = 0;
+    const t0 = performance.now();
+    if (mode === 'async') { const p = WebAssembly.compile(b); blocked = performance.now() - t0; mod = await p; }
+    else { const w = new Worker(wurl); mod = await new Promise(r => { w.onmessage = e => r(e.data); w.postMessage({ bytes: b, warm: mode === 'worker-warm' }); }); w.terminate(); }
+    const t1 = performance.now(); const inst = new WebAssembly.Instance(mod, mk()); const t2 = performance.now();
+    inst.exports.f(0,0,0); const t3 = performance.now(); inst.exports.f(0,0,0); const t4 = performance.now();
+    tot.get += blocked; tot.inst += t2 - t1; tot.first += t3 - t2; tot.second += t4 - t3;
+  }
+  const n = bufs.length;
+  console.log(`LAZY ${mode} per page: on-thread compile ${(tot.get/n).toFixed(3)} ms, Instance ${(tot.inst/n).toFixed(3)} ms, first call ${(tot.first/n).toFixed(3)} ms, second call ${(tot.second/n).toFixed(4)} ms`);
+}
+console.log('LAZY done');
+</script>
